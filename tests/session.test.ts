@@ -139,7 +139,9 @@ test("parallel prompts use each profile's preset and variables while the user's 
     selectedAtRequest.push(f.state.preset);
     if (!url.includes("dry-run")) return Response.json({ id: "reply" });
     const body = JSON.parse(String(options.body)); dryRuns.push(body);
-    return Response.json({ messages: [{ role: "system", content: body.preset_id }], parameters: {}, provider: "custom", model: body.connection_id,
+    return Response.json({ messages: [{ role: "system", content: "Display-only text" }], request_messages: [{ role: "system", content: body.preset_id },
+      { role: "user", content: [{ type: "audio", data: "UklGRg==", mime_type: "audio/wav" }] },
+      { role: "assistant", content: "Reply", reasoning_content: "Thought", thinking_blocks: [{ type: "thinking", thinking: "Signed", signature: "signature" }] }], parameters: {}, provider: "custom", model: body.connection_id,
       variable_state: { local: { tone: body.preset_id }, global: {}, chat: {} } });
   }) as typeof fetch;
   try {
@@ -154,6 +156,10 @@ test("parallel prompts use each profile's preset and variables while the user's 
       ["source", "main", true], ["second-source", "alternate", true],
     ]);
     const prompts = f.calls.find(c => c.operation === "launch")!.input.prompts;
+    expect(dryRuns.every(request => request.include_request_messages === true)).toBe(true);
+    expect(prompts[0].messages).toEqual([{ role: "system", content: "source" },
+      { role: "user", content: [{ type: "audio", data: "UklGRg==", mime_type: "audio/wav" }] },
+      { role: "assistant", content: "Reply", reasoning_content: "Thought", thinking_blocks: [{ type: "thinking", thinking: "Signed", signature: "signature" }] }]);
     expect(prompts.map((p: any) => p.variableState.local.tone)).toEqual(["source", "second-source"]);
     expect(prompts.map((p: any) => [p.provider, p.model])).toEqual([["custom", "main"], ["custom", "alternate"]]);
     expect(f.actions).toEqual([]);
@@ -170,13 +176,27 @@ test("opening a fork keeps the session enabled without switching the user's pres
   await session.disable(); expect(f.state.preset).toBe("source"); await session.dispose();
 });
 
+test("a host without prepared messages fails before creating a reply or sending provider requests", async () => {
+  const f = fixture(), session = f.make(), previousFetch = globalThis.fetch;
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: string) => { urls.push(url); return Response.json({ messages: [{ role: "user", content: "Display text" }] }); }) as typeof fetch;
+  try {
+    await session.enable(f.catalog);
+    f.receive({ type: "prepare", runId: "run", chatId: "chat", name: "Cat", slots: [{ presetId: "source", connectionId: "main" }] });
+    await Bun.sleep(5);
+    expect(urls).toHaveLength(1); expect(urls[0]).toContain("dry-run");
+    expect(f.calls.some(call => call.operation === "launch")).toBe(false);
+    expect(f.calls.find(call => call.operation === "preparationFailed")?.input.error).toContain("prepared request messages");
+  } finally { globalThis.fetch = previousFetch; await session.dispose(); }
+});
+
 test.each([false, true])("cancellation during reply creation cleans up before unload, with response loss %s", async lost => {
   const f = fixture(), session = f.make(), previousFetch = globalThis.fetch;
   let acknowledge!: () => void;
   let creating!: () => void;
   const created = new Promise<void>(resolve => { creating = resolve; });
   globalThis.fetch = (async (url: string, options: RequestInit) => {
-    if (url.includes("dry-run")) return Response.json({ messages: [{ role: "user", content: "Hi" }], parameters: {}, provider: "custom", model: "fixture" });
+    if (url.includes("dry-run")) return Response.json({ request_messages: [{ role: "user", content: "Hi" }], parameters: {}, provider: "custom", model: "fixture" });
     return new Promise<Response>((resolve, reject) => {
       options.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
       acknowledge = () => lost ? reject(new Error("Response lost after creating the reply")) : resolve(Response.json({ id: "late-reply" })); creating();

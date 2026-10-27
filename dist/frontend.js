@@ -195,14 +195,17 @@ class Session {
           connection_id: slot.connectionId,
           preset_id: prepared.presetId,
           force_preset_id: true,
+          include_request_messages: true,
           persona_id: message.personaId,
           generation_type: "normal"
         }, abort.signal);
+        if (!Array.isArray(value.request_messages))
+          throw new Error("Update Lumiverse to a build with prepared request messages before using CAT.");
         return {
           connectionId: slot.connectionId,
           captureToken: prepared.token,
           variableState: value.variable_state,
-          messages: value.messages.map((m) => ({ role: m.role, content: m.content, ...m.name ? { name: m.name } : {} })),
+          messages: value.request_messages,
           parameters: value.parameters,
           provider: value.provider,
           model: value.model,

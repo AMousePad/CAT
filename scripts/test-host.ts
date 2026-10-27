@@ -135,6 +135,7 @@ try {
   await api("/api/v1/settings", "PUT", { activeLoomPresetId: presets[0].id, activeProfileId: connection.id, activeChatId: chat.id });
   const vanillaDryRun = await api("/api/v1/generate/dry-run", "POST", { chat_id: chat.id, connection_id: connection.id, generation_type: "normal" });
   assert(!Object.hasOwn(vanillaDryRun, "variable_state"));
+  assert(!Object.hasOwn(vanillaDryRun, "request_messages"));
   pass("ordinary native dry runs retain their response shape without snapshot allocation");
   const legacy = await api("/api/v1/presets", "POST", { name: "Renamed compatibility preset", provider: "loom", metadata: { another_one: { kind: "controller", version: 1 } } });
   const sameName = await api("/api/v1/presets", "POST", { name: "CAT (Cross-Compatibility Preset)", provider: "loom" });
@@ -174,15 +175,18 @@ try {
         assert(!JSON.stringify(portable).includes(source.prompt_order[0].content));
         assert.deepEqual(copy.metadata._lumiverse_sealed_preset, source.metadata._lumiverse_sealed_preset);
       }
-      const dry = await api("/api/v1/generate/dry-run", "POST", { chat_id: targetChatId, connection_id: s.connectionId, preset_id: capture.presetId, force_preset_id: true, generation_type: "normal" });
+      const dry = await api("/api/v1/generate/dry-run", "POST", { chat_id: targetChatId, connection_id: s.connectionId, preset_id: capture.presetId, force_preset_id: true, include_request_messages: true, generation_type: "normal" });
       assert.deepEqual(await api(`/api/v1/presets/${s.presetId}`), source, "preparing must not modify the source preset");
-      return { messages: dry.messages, parameters: dry.parameters, provider: dry.provider, model: dry.model, connectionId: s.connectionId, prefill: dry.assistantPrefill, captureToken: capture.token, variableState: dry.variable_state };
+      return { messages: dry.request_messages, parameters: dry.parameters, provider: dry.provider, model: dry.model, connectionId: s.connectionId, prefill: dry.assistantPrefill, captureToken: capture.token, variableState: dry.variable_state };
     }));
     const reply = await api(`/api/v1/chats/${targetChatId}/messages`, "POST", { is_user: false, name: prepared.name, content: "", extra: { character_id: character.id, spindle_metadata: { another_one_run: prepared.runId } } });
     await rpc("launch", { runId: prepared.runId, messageId: reply.id, prompts });
     return reply.id;
   }
   await rpc("arm", { chatId: chat.id, connectionId: connection.id });
+  const { interceptorPipeline } = await fromHost("spindle/interceptor-pipeline.ts");
+  interceptorPipeline.register({ extensionId: "synthetic-audio", priority: 100, handler: async (messages: any[]) => ({ messages: messages.map(message => message.role === "user"
+    ? { ...message, content: [{ type: "text", text: message.content }, { type: "audio", data: "UklGRg==", mime_type: "audio/wav" }] } : message) }) });
   const replyId = await begin("USER_TURN_ONE: Tell me about the rain.");
   await until("three concurrent provider streams", () => maxActive, n => n === 3);
   const thinking = await until("parallel reasoning before prose", async () => (await api(`/api/v1/chats/${chat.id}/messages?full=true`)).data.at(-1),
@@ -237,6 +241,10 @@ try {
     assert(!JSON.stringify(req.messages).includes("anotherone_capture_variables"));
   }
   pass("slot order, full replies, preset samplers and optional connections are preserved with no extra native call");
+  assert(requests.every(request => request.messages.some((message: any) => Array.isArray(message.content)
+    && message.content.some((part: any) => part.type === "input_audio" && part.input_audio?.data === "UklGRg=="))));
+  interceptorPipeline.unregisterByExtension("synthetic-audio");
+  pass("interceptor-injected audio reaches every provider request as structured media");
   pass("bound connection presets cannot replace prepared models or inject disabled samplers and stop strings");
   assert.equal((await api("/api/v1/settings/activeLoomPresetId")).value, presets[0].id);
   assert(!(await api("/api/v1/presets?limit=100")).data.some((p: any) => p.metadata?.another_one?.kind === "controller"));
