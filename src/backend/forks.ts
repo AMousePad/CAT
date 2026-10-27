@@ -3,6 +3,7 @@ import { contentHash } from "../generation/preset-context";
 import { applyVariableSelection, persistentVariables, variableChanges, type AppliedVariables, type MessageVariables, type VariableChange, type VariableSnapshot } from "../generation/variable-state";
 import { restoreRunHistory } from "./run-history";
 import type { Storage } from "./storage";
+import { compareChatMetadata } from "./chat-metadata";
 
 const keyedChanges = (changes: VariableChange[]) => new Map(changes.map(change => [`${change.scope}:${change.key}`, change]));
 const variableValue = (state: Pick<VariableSnapshot, "global" | "chat">, change: VariableChange) =>
@@ -84,9 +85,18 @@ export class Forks {
     const chat = await this.api.chats.get(chatId, user);
     if (!chat || typeof chat.metadata.branched_from !== "string" || chat.metadata.another_one_fork === chatId) return;
     const messages = await this.api.chat.getMessages(chatId);
-    if (!chat.metadata.another_one_applied_variables && !messages.some(m => m.metadata?.another_one_run)) return;
     const branchId = messages[0]?.branch_id;
-    if (!branchId) return;
+    if (branchId) await restoreRunHistory(this.api, this.storage, user, chat, messages.filter(m => m.branch_id === branchId));
+    for (let attempt = 0; attempt < 5; attempt++) if (await this.initializeVariables(user, chatId)) return;
+    throw new Error("The fork kept changing while restoring its variables. Try again.");
+  }
+  private async initializeVariables(user: string, chatId: string) {
+    const chat = await this.api.chats.get(chatId, user);
+    if (!chat || typeof chat.metadata.branched_from !== "string" || chat.metadata.another_one_fork === chatId) return true;
+    const messages = await this.api.chat.getMessages(chatId);
+    if (!chat.metadata.another_one_applied_variables && !messages.some(m => m.metadata?.another_one_run)) return true;
+    const branchId = messages[0]?.branch_id;
+    if (!branchId) return true;
     const copied = messages.filter(m => m.branch_id === branchId);
     const source = await this.api.chats.get(chat.metadata.branched_from, user);
     const sourceMessages = source ? await this.api.chat.getMessages(source.id) : [];
@@ -142,15 +152,10 @@ export class Forks {
         nextApplied = selected ? { messageId: last!.id, slot: selected.index, changes: selected.slot.changes } : undefined;
       }
     }
-    await restoreRunHistory(this.api, this.storage, user, chat, copied);
-    // Fetch again so unrelated metadata changes during the copy are retained.
-    const latest = await this.api.chats.get(chatId, user);
-    if (!latest) return;
-    const latestMetadata = latest.metadata as Record<string, any>;
+    const latestMetadata = chat.metadata as Record<string, any>;
     const maps = { global: new Map(Object.entries(latestMetadata.macro_variables?.global || {})), chat: new Map(Object.entries(latestMetadata.chat_variables || {})) };
     const current = persistentVariables(latestMetadata);
     for (const change of variableChanges(persistentVariables(chat.metadata), { local: {}, ...values })) {
-      // Preserve edits made while initialization awaited host operations.
       if ((current[change.scope][change.key] ?? null) !== change.before) continue;
       if (change.after === null) maps[change.scope].delete(change.key);
       else maps[change.scope].set(change.key, change.after);
@@ -158,7 +163,9 @@ export class Forks {
     const metadata = { ...latestMetadata, macro_variables: { ...latestMetadata.macro_variables, global: Object.fromEntries(maps.global) },
       chat_variables: Object.fromEntries(maps.chat), another_one_applied_variables: nextApplied, another_one_fork: chatId };
     if (!nextApplied) delete metadata.another_one_applied_variables;
-    await this.api.chats.update(chatId, { metadata }, user);
+    const target = [...messages].reverse().find(m => m.role === "assistant");
+    if (!await compareChatMetadata(this.api, user, chatId, chat.metadata, metadata, messages, target)) return false;
     this.api.sendToFrontend({ type: "historyChanged" }, user);
+    return true;
   }
 }

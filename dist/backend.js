@@ -1113,6 +1113,17 @@ async function restoreRunHistory(api, storage, user, chat, messages, skip = () =
   return true;
 }
 
+// src/backend/chat-metadata.ts
+async function compareChatMetadata(api, user, chatId, expected, metadata, messages, target) {
+  const chats = api.chats;
+  return await chats.compareAndSetMetadata(chatId, {
+    expected_metadata: expected,
+    metadata,
+    expected_last_message_id: messages.at(-1)?.id ?? null,
+    ...target ? { expected_message: { id: target.id, swipe_id: target.swipe_id, swipes: target.swipes, metadata: target.metadata ?? {} } } : {}
+  }, user) !== null;
+}
+
 // src/backend/forks.ts
 var keyedChanges = (changes) => new Map(changes.map((change) => [`${change.scope}:${change.key}`, change]));
 var variableValue = (state, change) => Object.hasOwn(state[change.scope] ?? {}, change.key) ? state[change.scope][change.key] : null;
@@ -1205,11 +1216,24 @@ class Forks {
     if (!chat || typeof chat.metadata.branched_from !== "string" || chat.metadata.another_one_fork === chatId)
       return;
     const messages = await this.api.chat.getMessages(chatId);
+    const branchId = messages[0]?.branch_id;
+    if (branchId)
+      await restoreRunHistory(this.api, this.storage, user, chat, messages.filter((m) => m.branch_id === branchId));
+    for (let attempt = 0;attempt < 5; attempt++)
+      if (await this.initializeVariables(user, chatId))
+        return;
+    throw new Error("The fork kept changing while restoring its variables. Try again.");
+  }
+  async initializeVariables(user, chatId) {
+    const chat = await this.api.chats.get(chatId, user);
+    if (!chat || typeof chat.metadata.branched_from !== "string" || chat.metadata.another_one_fork === chatId)
+      return true;
+    const messages = await this.api.chat.getMessages(chatId);
     if (!chat.metadata.another_one_applied_variables && !messages.some((m) => m.metadata?.another_one_run))
-      return;
+      return true;
     const branchId = messages[0]?.branch_id;
     if (!branchId)
-      return;
+      return true;
     const copied = messages.filter((m) => m.branch_id === branchId);
     const source = await this.api.chats.get(chat.metadata.branched_from, user);
     const sourceMessages = source ? await this.api.chat.getMessages(source.id) : [];
@@ -1270,11 +1294,7 @@ class Forks {
         nextApplied = selected ? { messageId: last.id, slot: selected.index, changes: selected.slot.changes } : undefined;
       }
     }
-    await restoreRunHistory(this.api, this.storage, user, chat, copied);
-    const latest = await this.api.chats.get(chatId, user);
-    if (!latest)
-      return;
-    const latestMetadata = latest.metadata;
+    const latestMetadata = chat.metadata;
     const maps = { global: new Map(Object.entries(latestMetadata.macro_variables?.global || {})), chat: new Map(Object.entries(latestMetadata.chat_variables || {})) };
     const current = persistentVariables(latestMetadata);
     for (const change of variableChanges(persistentVariables(chat.metadata), { local: {}, ...values })) {
@@ -1294,8 +1314,11 @@ class Forks {
     };
     if (!nextApplied)
       delete metadata.another_one_applied_variables;
-    await this.api.chats.update(chatId, { metadata }, user);
+    const target = [...messages].reverse().find((m) => m.role === "assistant");
+    if (!await compareChatMetadata(this.api, user, chatId, chat.metadata, metadata, messages, target))
+      return false;
     this.api.sendToFrontend({ type: "historyChanged" }, user);
+    return true;
   }
 }
 
@@ -1332,7 +1355,13 @@ class VariableSelection {
   }
   sync(user, chatId) {
     const key = `${user}:${chatId}`;
-    const work = (this.chains.get(key) || Promise.resolve()).catch(() => {}).then(() => this.apply(user, chatId));
+    const work = (this.chains.get(key) || Promise.resolve()).catch(() => {}).then(async () => {
+      await this.prepareChat?.(user, chatId);
+      for (let attempt = 0;attempt < 5; attempt++)
+        if (await this.apply(user, chatId))
+          return;
+      throw new Error("The chat kept changing while applying swipe variables. Try again.");
+    });
     this.chains.set(key, work);
     work.finally(() => {
       if (this.chains.get(key) === work)
@@ -1341,31 +1370,32 @@ class VariableSelection {
     return work;
   }
   async apply(user, chatId) {
-    await this.prepareChat?.(user, chatId);
     const messages = await this.api.chat.getMessages(chatId);
     const target = [...messages].reverse().find((m) => m.role === "assistant");
     const selected = target && await selectedVariables(target);
     const chat = await this.api.chats.get(chatId, user);
     if (!chat)
-      return;
+      return true;
     const applied = chat.metadata.another_one_applied_variables;
     if (!target || !selected) {
       if (applied && !messages.some((m) => m.id === applied.messageId)) {
-        await this.save(user, chatId, chat.metadata, applyVariableSelection(persistentVariables(chat.metadata), applied.changes, []));
+        return this.save(user, chatId, chat.metadata, applyVariableSelection(persistentVariables(chat.metadata), applied.changes, []), messages, target);
       }
-      return;
+      return true;
     }
     const { slot, index } = selected;
     if (applied?.messageId === target.id && applied.slot === index)
-      return;
+      return true;
     const previousMessageId = applied?.messageId;
     const prior = previousMessageId === target.id || previousMessageId && !messages.some((m) => m.id === previousMessageId) ? applied?.changes || [] : [];
     const current = persistentVariables(chat.metadata);
     const values = applyVariableSelection(current, prior, slot.changes);
-    await this.save(user, chatId, chat.metadata, values, { messageId: target.id, slot: index, changes: slot.changes });
+    if (!await this.save(user, chatId, chat.metadata, values, messages, target, { messageId: target.id, slot: index, changes: slot.changes }))
+      return false;
     this.remember(`${user}:${chatId}`, `${target.id}:${target.swipe_id}:${target.swipes.length}`);
+    return true;
   }
-  async save(user, chatId, metadata, values, applied) {
+  async save(user, chatId, metadata, values, messages, target, applied) {
     const current = persistentVariables(metadata);
     const maps = { global: new Map(Object.entries(metadata.macro_variables?.global || {})), chat: new Map(Object.entries(metadata.chat_variables || {})) };
     for (const change of variableChanges(current, { local: {}, ...values })) {
@@ -1382,7 +1412,7 @@ class VariableSelection {
     };
     if (!applied)
       delete next.another_one_applied_variables;
-    await this.api.chats.update(chatId, { metadata: next }, user);
+    return compareChatMetadata(this.api, user, chatId, metadata, next, messages, target);
   }
 }
 
@@ -1438,6 +1468,8 @@ async function loadCatalog(userId, chatId) {
     throw new Error("Update Lumiverse to a build with message metadata patch support before enabling CAT.");
   if (!spindle.host.capabilities["generation-request-messages-v1"])
     throw new Error("Update Lumiverse to a build with prepared request messages before enabling CAT.");
+  if (!spindle.host.capabilities["chat-conditional-metadata-v1"])
+    throw new Error("Update Lumiverse to a build with conditional chat metadata updates before enabling CAT.");
   const presets = await listSourcePresets(spindle.presets, userId);
   const [settings, connections, history, activation] = await Promise.all([storage.settings(userId), spindle.connections.list(userId), chatId ? storage.history(userId, chatId) : [], storage.activation(userId)]);
   return { settings, history, activation, presets, connections: connections.map((c) => ({ id: c.id, name: c.name, model: c.model })) };

@@ -6,6 +6,25 @@ import { selectSwipe } from "../src/backend/select-swipe";
 import { contentHash } from "../src/generation/preset-context";
 import type { RunRecord } from "../src/shared";
 import type { Storage } from "../src/backend/storage";
+import { conditionalMetadata } from "./helpers/conditional-metadata";
+
+test("fork variable initialization retries rather than overwriting a concurrent edit", async () => {
+  const f = await fixture();
+  const chats = f.api.chats as any;
+  const compare = chats.compareAndSetMetadata;
+  let attempts = 0;
+  chats.compareAndSetMetadata = async (id: string, input: any) => {
+    if (++attempts === 1) {
+      f.chats.get(id).metadata.unrelated = "keep";
+      f.chats.get(id).metadata.chat_variables.counter = "manual";
+    }
+    return compare(id, input);
+  };
+  await f.forks.ensure("u", "fork");
+  expect(attempts).toBe(2);
+  expect(f.chats.get("fork").metadata.unrelated).toBe("keep");
+  expect(f.chats.get("fork").metadata.chat_variables.counter).toBe("manual");
+});
 
 async function fixture(forkAt = 0) {
   const make = async (id: string, index: number, before: string, after: string, extra = false) => {
@@ -31,7 +50,9 @@ async function fixture(forkAt = 0) {
   const handlers = new Map<string, Function>();
   const api = { on: (event: string, fn: Function) => { handlers.set(event, fn); return () => {}; }, log: { error() {} }, sendToFrontend() {},
     presets: { get: async (id: string) => ({ id, name: `Preset ${id}` }) },
-    chats: { get: async (id: string) => structuredClone(chats.get(id) ?? null), update: async (id: string, patch: any) => { writes++; Object.assign(chats.get(id), structuredClone(patch)); } },
+    chats: { get: async (id: string) => structuredClone(chats.get(id) ?? null), compareAndSetMetadata: async (id: string, input: any) => {
+      const result = conditionalMetadata(chats.get(id), messages.get(id)!, input); if (result) writes++; return result;
+    } },
     chat: { getMessages: async (id: string) => structuredClone(messages.get(id)), updateMessage: async (chatId: string, id: string, patch: any) => {
       writes++; const m = messages.get(chatId)!.find(m => m.id === id); Object.assign(m, structuredClone(patch));
       if (patch.metadata_patch) Object.assign(m.metadata, structuredClone(patch.metadata_patch));

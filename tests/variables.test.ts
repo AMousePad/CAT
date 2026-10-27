@@ -5,6 +5,7 @@ import { VariableSelection } from "../src/backend/variable-selection";
 import { applyVariableSelection, variableChanges, type MessageVariables } from "../src/generation/variable-state";
 import { contentHash } from "../src/generation/preset-context";
 import { selectedVariables } from "../src/backend/forks";
+import { conditionalMetadata } from "./helpers/conditional-metadata";
 
 test("native context distinguishes unchanged and changed slots of the same preset", async () => {
   const message = { id: "reply", content: "Same prose", swipes: ["Same prose", "Same prose"], swipe_id: 1, metadata: {
@@ -83,7 +84,10 @@ test("selected persistent state survives reload, handles deleted earlier swipes,
   let messages: any[] = [message];
   let writes = 0;
   const api = { on: () => () => {}, log: { error: () => {} }, chat: { getMessages: async () => structuredClone(messages) },
-    chats: { get: async () => ({ metadata: structuredClone(metadata) }), update: async (_c: string, patch: any) => { metadata = patch.metadata; writes++; } },
+    chats: { get: async () => ({ metadata: structuredClone(metadata) }), compareAndSetMetadata: async (_c: string, patch: any) => {
+      const chat = { metadata }; const result = conditionalMetadata(chat, messages, patch);
+      if (result) { metadata = chat.metadata; writes++; } return result;
+    } },
   } as unknown as SpindleAPI;
   const manager = new VariableSelection(api);
   await manager.sync("user", "chat"); expect(metadata.chat_variables.count).toBe("1");
@@ -118,6 +122,40 @@ test("cancel removes only its run's prepared state", async () => {
   await expect(f.capture.finish("user", "first", "source", first.token, state)).rejects.toThrow("does not match");
   expect((await f.capture.finish("user", "other", "source", other.token, state)).changes).toEqual([]);
   expect(f.copies.size).toBe(0);
+});
+
+test("variable writes recompute after concurrent metadata, selection and message changes", async () => {
+  for (const race of ["metadata", "selection", "deletion", "new-message", "busy"]) {
+    const chat: any = { metadata: { chat_variables: { count: "0" } } };
+    const messages: any[] = [{ id: "reply", role: "assistant", content: "A", swipe_id: 0, swipes: ["A", "B"], metadata: {
+      another_one_variables: { version: 1, slots: ["1", "10"].map((after, i) => ({ presetId: `p${i}`, local: {},
+        swipeId: `s${i}`, changes: [{ scope: "chat", key: "count", before: "0", after }] })) },
+      preset_contexts: [0, 1].map(i => ({ preset_id: `p${i}`, another_one_swipe_id: `s${i}` })),
+    } }];
+    let attempts = 0;
+    const api = { on: () => () => {}, chat: { getMessages: async () => structuredClone(messages) },
+      chats: { get: async () => structuredClone(chat), compareAndSetMetadata: async (_id: string, input: any) => {
+        if (++attempts === 1 || race === "busy") {
+          if (race === "metadata" || race === "busy") chat.metadata.external = attempts;
+          if (race === "selection") { messages[0].swipe_id = 1; messages[0].content = "B"; }
+          if (race === "deletion") messages.splice(0);
+          if (race === "new-message") messages.push({ id: "new", role: "assistant", swipe_id: 0, swipes: ["Native"], metadata: {} });
+        }
+        return conditionalMetadata(chat, messages, input);
+      } },
+    } as unknown as SpindleAPI;
+    const manager = new VariableSelection(api);
+    if (race === "busy") {
+      await expect(manager.sync("user", "chat")).rejects.toThrow("kept changing");
+      expect(attempts).toBe(5); expect(chat.metadata.chat_variables.count).toBe("0");
+    } else {
+      await manager.sync("user", "chat");
+      expect(chat.metadata.chat_variables.count).toBe(race === "metadata" ? "1" : race === "selection" ? "10" : "0");
+      if (race === "metadata") expect(chat.metadata.external).toBe(1);
+      if (race === "selection") expect(chat.metadata.another_one_applied_variables.slot).toBe(1);
+      if (race === "deletion" || race === "new-message") expect(chat.metadata.another_one_applied_variables).toBeUndefined();
+    }
+  }
 });
 
 test("sealed presets prepare directly, preserving their content and provenance", async () => {

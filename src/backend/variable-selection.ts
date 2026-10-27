@@ -1,6 +1,7 @@
 import type { SpindleAPI } from "lumiverse-spindle-types";
 import { applyVariableSelection, persistentVariables, variableChanges, type AppliedVariables } from "../generation/variable-state";
 import { selectedVariables } from "./forks";
+import { compareChatMetadata } from "./chat-metadata";
 
 export class VariableSelection {
   private chains = new Map<string, Promise<unknown>>();
@@ -25,36 +26,40 @@ export class VariableSelection {
   }
   sync(user: string, chatId: string): Promise<void> {
     const key = `${user}:${chatId}`;
-    const work = (this.chains.get(key) || Promise.resolve()).catch(() => {}).then(() => this.apply(user, chatId));
+    const work = (this.chains.get(key) || Promise.resolve()).catch(() => {}).then(async () => {
+      await this.prepareChat?.(user, chatId);
+      for (let attempt = 0; attempt < 5; attempt++) if (await this.apply(user, chatId)) return;
+      throw new Error("The chat kept changing while applying swipe variables. Try again.");
+    });
     this.chains.set(key, work);
     void work.finally(() => { if (this.chains.get(key) === work) this.chains.delete(key); }).catch(() => {});
     return work;
   }
   private async apply(user: string, chatId: string) {
-    await this.prepareChat?.(user, chatId);
     const messages = await this.api.chat.getMessages(chatId);
     const target = [...messages].reverse().find(m => m.role === "assistant");
     const selected = target && await selectedVariables(target);
     const chat = await this.api.chats.get(chatId, user);
-    if (!chat) return;
+    if (!chat) return true;
     const applied = chat.metadata.another_one_applied_variables as (AppliedVariables & { slot: number }) | undefined;
     if (!target || !selected) {
       if (applied && !messages.some(m => m.id === applied.messageId)) {
-        await this.save(user, chatId, chat.metadata, applyVariableSelection(persistentVariables(chat.metadata), applied.changes, []));
+        return this.save(user, chatId, chat.metadata, applyVariableSelection(persistentVariables(chat.metadata), applied.changes, []), messages, target);
       }
-      return;
+      return true;
     }
     const { slot, index } = selected;
-    if (applied?.messageId === target.id && applied.slot === index) return;
+    if (applied?.messageId === target.id && applied.slot === index) return true;
     const previousMessageId = applied?.messageId;
     const prior = previousMessageId === target.id || (previousMessageId && !messages.some(m => m.id === previousMessageId)) ? applied?.changes || [] : [];
     const current = persistentVariables(chat.metadata);
     const values = applyVariableSelection(current, prior, slot.changes);
-    await this.save(user, chatId, chat.metadata, values, { messageId: target.id, slot: index, changes: slot.changes });
+    if (!await this.save(user, chatId, chat.metadata, values, messages, target, { messageId: target.id, slot: index, changes: slot.changes })) return false;
     this.remember(`${user}:${chatId}`, `${target.id}:${target.swipe_id}:${target.swipes.length}`);
+    return true;
   }
   private async save(user: string, chatId: string, metadata: Record<string, any>,
-    values: ReturnType<typeof persistentVariables>, applied?: AppliedVariables & { slot: number }) {
+    values: ReturnType<typeof persistentVariables>, messages: Parameters<typeof compareChatMetadata>[5], target?: Parameters<typeof compareChatMetadata>[6], applied?: AppliedVariables & { slot: number }) {
     const current = persistentVariables(metadata);
     const maps = { global: new Map(Object.entries(metadata.macro_variables?.global || {})), chat: new Map(Object.entries(metadata.chat_variables || {})) };
     for (const change of variableChanges(current, { local: {}, ...values })) {
@@ -67,6 +72,6 @@ export class VariableSelection {
       another_one_applied_variables: applied,
     };
     if (!applied) delete next.another_one_applied_variables;
-    await this.api.chats.update(chatId, { metadata: next }, user);
+    return compareChatMetadata(this.api, user, chatId, metadata, next, messages, target);
   }
 }
