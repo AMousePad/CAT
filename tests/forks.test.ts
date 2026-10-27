@@ -157,6 +157,28 @@ test("streaming copies are independent partial replies and remain selectable", a
   expect(f.chats.get("fork").metadata.chat_variables.counter).toBe("10");
 });
 
+test("forks retain connection labels and status when same-preset swipes are edited to identical text", async () => {
+  const f = await fixture(7);
+  const source = f.messages.get("source")!.at(-1)!;
+  const copy = f.messages.get("fork")!.at(-1)!;
+  const original = f.history.find(run => run.messageId === source.id)!;
+  for (const message of [source, copy]) for (let i = 0; i < 2; i++) {
+    message.metadata.preset_contexts[i].preset_id = "same";
+    message.metadata.preset_contexts[i].another_one_swipe_id = `id-${i}`;
+    message.metadata.another_one_variables.slots[i].presetId = "same";
+    message.metadata.another_one_variables.slots[i].swipeId = `id-${i}`;
+  }
+  for (let i = 0; i < 2; i++) Object.assign(original.steps[i], { presetId: "same", swipeId: `id-${i}`, connectionName: `Connection ${i}`, contentHash: await contentHash(source.swipes[i]) });
+  original.steps[0].status = "error"; original.steps[0].error = "Interrupted";
+  copy.swipes[0] = copy.swipes[1]; copy.content = copy.swipes[0];
+  await f.forks.ensure("u", "fork");
+  const run = f.history.find(run => run.messageId === copy.id)!;
+  expect(run.steps.map(step => step.connectionName)).toEqual(["Connection 0", "Connection 1"]);
+  expect(run.steps[0]).toMatchObject({ status: "error", error: "Interrupted", swipeId: "id-0" });
+  await selectSwipe(f.api, run, 0, () => f.variables.sync("u", "fork"));
+  expect(f.chats.get("fork").metadata.chat_variables.counter).toBe("3");
+});
+
 test("fork restoration ignores source generations made after the copy and keeps an unrelated edit", async () => {
   const f = await fixture();
   const future = structuredClone(f.messages.get("source")![2]); future.id = "future"; future.index_in_chat = 9;

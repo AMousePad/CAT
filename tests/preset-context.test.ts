@@ -33,3 +33,25 @@ test("live navigation requires the original slot shape and some streamed text", 
   await expect(findSwipe(run, 1, { ...message, swipes: ["B partial"] })).rejects.toThrow("not available yet");
   await expect(findSwipe(run, 1, { ...message, swipes: ["A partial", ""] })).rejects.toThrow("not available yet");
 });
+
+test("stable swipe identities survive edits, deletion and duplicate preset content", async () => {
+  const run: RunRecord = { id: "run", chatId: "chat", messageId: "reply", chatName: "Chat", at: 0, outcome: "complete",
+    steps: ["first", "second"].map(swipeId => ({ swipeId, presetId: "same", presetName: "Same", connectionName: "Main", status: "done" })) };
+  for (const step of run.steps) step.contentHash = await contentHash("Original");
+  const message = { id: "reply", chat_id: "chat", swipes: ["Edited by a tool"], extra: { spindle_metadata: { another_one_run: "run",
+    preset_contexts: [{ preset_id: "same", another_one_swipe_id: "second" }] } } };
+  expect(await findSwipe(run, 1, message)).toBe(0);
+  await expect(findSwipe(run, 0, message)).rejects.toThrow("no longer available");
+  await expect(findSwipe(run, 1, { ...message, swipes: ["Original"], extra: { spindle_metadata: { another_one_run: "run" } } })).rejects.toThrow("no longer available");
+});
+
+test("legacy edited swipes use unique saved preset context without guessing between identical profiles", async () => {
+  const run: RunRecord = { id: "run", chatId: "chat", messageId: "reply", chatName: "Chat", at: 0, outcome: "complete",
+    steps: ["a", "b"].map(presetId => ({ presetId, presetName: presetId, connectionName: "Main", status: "done" })) };
+  for (const step of run.steps) step.contentHash = await contentHash("Original");
+  const message = { id: "reply", chat_id: "chat", swipes: ["Edited"], extra: { spindle_metadata: { another_one_run: "run", preset_contexts: [{ preset_id: "b" }] } } };
+  expect(await findSwipe(run, 1, message)).toBe(0);
+  await expect(findSwipe(run, 0, { ...message, swipes: ["Original"] })).rejects.toThrow("edited or deleted");
+  run.steps[0].presetId = "b";
+  await expect(findSwipe(run, 1, message)).rejects.toThrow("edited or deleted");
+});

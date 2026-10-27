@@ -34,7 +34,7 @@ export interface Catalog { settings: Settings; presets: Choice[]; connections: C
 export interface Inspection {
   chatId: string; chatName: string; blockedReason?: string; busy: boolean;
 }
-export interface RunStep { presetId: string; presetName: string; connectionName: string; status: "waiting" | "running" | "done" | "stopped" | "error"; swipe?: number; contentHash?: string; error?: string }
+export interface RunStep { presetId: string; presetName: string; connectionName: string; status: "waiting" | "running" | "done" | "stopped" | "error"; swipe?: number; swipeId?: string; contentHash?: string; error?: string }
 export interface RunRecord { id: string; chatId: string; chatName: string; messageId: string; messageIndex?: number; characterName?: string; at: number; steps: RunStep[]; outcome: "running" | "complete" | "stopped" | "error"; detail?: string }
 export interface MessageSummary { index: number; name: string }
 export interface ViewState { phase: "off" | "preparing" | "ready" | "running" | "stopping" | "error"; detail: string; run: RunRecord | null }

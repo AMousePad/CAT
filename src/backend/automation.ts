@@ -241,6 +241,7 @@ export class Automation {
     let messageIndex: number;
     let characterName: string;
     let variableState: MessageVariables | undefined;
+    const swipeIds = owner.slots.map(() => crypto.randomUUID());
     try {
       const messages = await this.api.chat.getMessages(owner.chatId);
       const last = messages.at(-1);
@@ -255,7 +256,7 @@ export class Automation {
         variableState = { version: 1, slots: await Promise.all(prompts.map(async (prompt, index) => {
           const prepared = await owner.prepared?.get(index);
           if (!prepared || prompt.captureToken !== prepared.token) throw new Error("This request has no captured variable state.");
-          return this.variables!.capture.finish(user, runId, owner.slots[index].presetId, prepared.token, prompt.variableState);
+          return { ...(await this.variables!.capture.finish(user, runId, owner.slots[index].presetId, prepared.token, prompt.variableState)), swipeId: swipeIds[index] };
         })) };
         if (JSON.stringify(variableState).length > 2_000_000) throw new Error("The combined variable state is too large to save.");
       }
@@ -265,7 +266,7 @@ export class Automation {
     clearTimeout(owner.deadline); owner.preparation = undefined;
     let firstWrite = true;
     const run = new ParallelRun({ id: runId, chatId: owner.chatId, chatName, messageId, messageIndex, characterName, at: Date.now(), outcome: "running",
-      steps: owner.slots.map(s => ({ presetId: s.presetId, presetName: owner.catalog.presets.find(p => p.id === s.presetId)!.name,
+      steps: owner.slots.map((s, i) => ({ swipeId: swipeIds[i], presetId: s.presetId, presetName: owner.catalog.presets.find(p => p.id === s.presetId)!.name,
         connectionName: owner.catalog.connections.find(c => c.id === s.connectionId)!.name, status: "waiting" })) }, prompts, {
       stream: (prompt, signal) => {
         // The prompt is already assembled. Quiet generation would merge the connection's bound preset again.
@@ -279,9 +280,10 @@ export class Automation {
         if (final && variableState) await Promise.all(variableState.slots.map(async (slot, i) => { slot.contentHash = await contentHash(swipes[i]); }));
         const patch = { swipes, swipe_reasoning: reasoning, skipChunkRebuild: true,
           ...(firstWrite || final ? { metadata_patch: { another_one_run: runId, another_one_presets: owner.slots.map(s => s.presetId),
+            preset_contexts: owner.slots.map((slot, i) => ({ preset_id: slot.presetId, another_one_swipe_id: swipeIds[i],
+              ...(variableState ? { variables: variableState.slots[i].snapshot } : {}) })),
             ...(variableState ? {
               another_one_variables: { ...variableState, slots: variableState.slots.map(({ snapshot: _, ...slot }) => slot) },
-              preset_contexts: variableState.slots.map(slot => ({ preset_id: slot.presetId, variables: slot.snapshot })),
             } : {}) } } : {}) };
         await this.api.chat.updateMessage(owner.chatId, messageId, patch);
         if (firstWrite || final) await this.variables?.selection.sync(user, owner.chatId);

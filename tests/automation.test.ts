@@ -6,7 +6,7 @@ import { Storage } from "../src/backend/storage";
 import type { Catalog } from "../src/shared";
 import { inspectChat } from "../src/backend/inspection";
 
-function fixture(savedStorage?: Storage) {
+function fixture(savedStorage?: Storage, variables?: ConstructorParameters<typeof Automation>[5]) {
   const handlers = new Map<string, Function>();
   let context!: (raw: unknown, signal?: AbortSignal) => Promise<any>;
   let messages: any[] = [];
@@ -45,7 +45,7 @@ function fixture(savedStorage?: Storage) {
   storage.record = async (_user, record) => { records.push(record); };
   storage.settings = async () => catalog.settings;
   const automation = new Automation(api, storage, new Leases(), async () => catalog,
-    (chatId, userId) => inspectChat(api, new Map(), chatId, userId));
+    (chatId, userId) => inspectChat(api, new Map(), chatId, userId), variables);
   const raw = { userId: "user", chatId: "chat", frontendSessionId: "session", connectionId: "c", generationType: "normal", dryRun: false };
   const emit = (event: string, payload: unknown) => handlers.get(event)!(payload, "user");
   async function arm() {
@@ -69,6 +69,31 @@ test("final streaming writes preserve metadata added by another extension", asyn
   await f.automation.disarm("user", "session", true);
   expect(message.metadata.other_extension).toEqual({ value: "written during streaming" });
   expect(message.metadata.another_one_presets).toEqual(["p"]);
+});
+
+test("swipe identities retain asynchronously captured variables and reject failed capture before streaming", async () => {
+  for (const fail of [false, true]) {
+    const snapshot = { local: { mode: "one" }, global: {}, chat: { counter: "1" } };
+    const variables = { capture: { create: async () => ({ token: "token", presetId: "p" }), cancel: async () => {},
+      finish: async () => { await Bun.sleep(1); if (fail) throw new Error("Capture failed"); return { presetId: "p", changes: [], local: snapshot.local, snapshot }; } },
+      selection: { sync: async () => {} } } as unknown as ConstructorParameters<typeof Automation>[5];
+    const f = fixture(undefined, variables); await f.arm(); await f.context();
+    f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
+    const prep = f.sent.find(s => s.type === "prepare");
+    await f.automation.preparePreset("user", "session", prep.runId, 0);
+    const message = { id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } as Record<string, any> };
+    f.setMessages([message]);
+    const launch = f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], captureToken: "token", parameters: {}, connectionId: "c", provider: "custom", model: "fixture" }]);
+    if (fail) { await expect(launch).rejects.toThrow("Capture failed"); expect(f.generated).toHaveLength(0); }
+    else {
+      await launch; await Bun.sleep(5);
+      const context = message.metadata.preset_contexts[0];
+      expect(context.variables).toEqual(snapshot);
+      expect(message.metadata.another_one_variables.slots[0]).toMatchObject({ presetId: "p", changes: [], local: snapshot.local, swipeId: context.another_one_swipe_id });
+      expect(f.automation.getRun("user", prep.runId)?.steps[0].swipeId).toBe(context.another_one_swipe_id);
+    }
+    await f.automation.disarm("user", "session", true);
+  }
 });
 
 test("disabling during enable cancels ownership; concurrent enable attempts cannot race", async () => {

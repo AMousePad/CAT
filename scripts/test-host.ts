@@ -216,6 +216,13 @@ try {
   assert(saved.extra.reasoningDurationBySwipe.every((ms: number) => ms > 0));
   assert(saved.swipes.every((s: string) => !s.includes("thought")));
   pass("reasoning stays separate from prose and follows the swipe selected during streaming");
+  assert.equal(new Set(saved.extra.spindle_metadata.preset_contexts.map((context: any) => context.another_one_swipe_id)).size, 3);
+  const editedText = saved.content + " Edited by an automatic tool.";
+  await api(`/api/v1/chats/${chat.id}/messages/${replyId}`, "PUT", { content: editedText });
+  await rpc("selectSwipe", { runId: liveRun.id, stepIndex: 0 });
+  await rpc("selectSwipe", { runId: liveRun.id, stepIndex: 1 });
+  assert.equal((await api(`/api/v1/chats/${chat.id}/messages?full=true`)).data.at(-1).content, editedText);
+  pass("native content edits preserve CAT swipe selection and per-swipe variables");
   for (const [i, marker] of [..."ABC"].entries()) {
     assert(saved.swipes[i].startsWith(`PRESET_${marker}`)); assert(saved.swipes[i].includes("word30"));
     const req = requests.find(r => r.marker === `PRESET_${marker}`);

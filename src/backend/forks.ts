@@ -22,12 +22,16 @@ function capturedValues(data: MessageVariables) {
 export async function selectedVariables(message: Awaited<ReturnType<SpindleAPI["chat"]["getMessages"]>>[number]) {
   const data = message.metadata?.another_one_variables as MessageVariables | undefined;
   if (data?.version !== 1 || !Array.isArray(data.slots)) return;
-  const contexts = message.metadata?.preset_contexts as Array<{ preset_id: string; variables?: VariableSnapshot } | null> | undefined;
+  const contexts = message.metadata?.preset_contexts as Array<{ preset_id: string; another_one_swipe_id?: string; variables?: VariableSnapshot } | null> | undefined;
   const context = contexts?.[message.swipe_id];
   if (Array.isArray(contexts) && !context) return;
   let index = message.swipe_id;
   let slot = data.slots[index];
-  if (context?.variables) {
+  if (context?.another_one_swipe_id) {
+    const matches = data.slots.flatMap((value, i) => value.swipeId === context.another_one_swipe_id && value.presetId === context.preset_id ? [i] : []);
+    if (matches.length !== 1) throw new Error("This swipe's original variable state is no longer available.");
+    index = matches[0]; slot = data.slots[index];
+  } else if (context?.variables) {
     const snapshot = context.variables;
     const baseline = keyedChanges(data.slots.flatMap(value => value.changes));
     const matches = data.slots.flatMap((value, i) => {
@@ -145,7 +149,7 @@ export class Forks {
       if (!message.metadata) continue;
       const id = `fork:${message.id}`;
       const original = history.find(r => r.id === message.metadata!.another_one_run);
-      const contexts = message.metadata.preset_contexts as Array<{ preset_id: string }> | undefined;
+      const contexts = message.metadata.preset_contexts as Array<{ preset_id: string; another_one_swipe_id?: string }> | undefined;
       const presets = message.metadata.another_one_presets as string[] | undefined;
       if (!Array.isArray(contexts) && !Array.isArray(presets)) continue;
       const steps = await Promise.all(message.swipes.map(async (content, index) => {
@@ -153,14 +157,17 @@ export class Forks {
         const hash = await contentHash(content);
         const expected = original?.steps[index];
         const matches = original?.steps.filter(s => s.presetId === presetId && s.contentHash === hash);
-        const prior = original?.steps.length === message.swipes.length && expected?.presetId === presetId
-          && (!expected.contentHash || expected.contentHash === hash) ? expected : matches?.length === 1 ? matches[0] : undefined;
+        const swipeId = contexts?.[index]?.another_one_swipe_id;
+        const identities = original?.steps.filter(s => s.swipeId === swipeId && s.presetId === presetId);
+        const prior = swipeId ? (identities?.length === 1 ? identities[0] : undefined)
+          : original?.steps.length === message.swipes.length && expected?.presetId === presetId
+            && (!expected.contentHash || expected.contentHash === hash) ? expected : matches?.length === 1 ? matches[0] : undefined;
         const data = message.metadata!.another_one_variables as MessageVariables | undefined;
         const unfinished = !prior && data?.slots.some(s => s.presetId === presetId && !s.contentHash);
         if (!names.has(presetId)) names.set(presetId, prior?.presetName ?? (await this.api.presets.get(presetId, user))?.name ?? "Deleted preset");
         return { presetId, presetName: names.get(presetId)!, connectionName: prior?.connectionName ?? "Copied reply",
           status: unfinished || prior?.status === "running" || prior?.status === "waiting" ? "stopped" as const : prior?.status ?? "done" as const,
-          swipe: index, contentHash: hash, ...(prior?.error ? { error: prior.error } : {}) };
+          swipe: index, swipeId: contexts?.[index]?.another_one_swipe_id, contentHash: hash, ...(prior?.error ? { error: prior.error } : {}) };
       }));
       const outcome = steps.some(s => s.status === "error") ? "error" : steps.some(s => s.status === "stopped") ? "stopped" : "complete";
       runs.push({ id, chatId, chatName: chat.name, messageId: message.id, messageIndex: message.index_in_chat, characterName: message.name, at: original?.at ?? message.send_date * 1000, steps, outcome });

@@ -682,6 +682,7 @@ class Automation {
     let messageIndex;
     let characterName;
     let variableState;
+    const swipeIds = owner.slots.map(() => crypto.randomUUID());
     try {
       const messages = await this.api.chat.getMessages(owner.chatId);
       const last = messages.at(-1);
@@ -700,7 +701,7 @@ class Automation {
           const prepared = await owner.prepared?.get(index);
           if (!prepared || prompt.captureToken !== prepared.token)
             throw new Error("This request has no captured variable state.");
-          return this.variables.capture.finish(user, runId, owner.slots[index].presetId, prepared.token, prompt.variableState);
+          return { ...await this.variables.capture.finish(user, runId, owner.slots[index].presetId, prepared.token, prompt.variableState), swipeId: swipeIds[index] };
         })) };
         if (JSON.stringify(variableState).length > 2000000)
           throw new Error("The combined variable state is too large to save.");
@@ -723,7 +724,8 @@ class Automation {
       characterName,
       at: Date.now(),
       outcome: "running",
-      steps: owner.slots.map((s) => ({
+      steps: owner.slots.map((s, i) => ({
+        swipeId: swipeIds[i],
         presetId: s.presetId,
         presetName: owner.catalog.presets.find((p) => p.id === s.presetId).name,
         connectionName: owner.catalog.connections.find((c) => c.id === s.connectionId).name,
@@ -756,9 +758,13 @@ class Automation {
           ...firstWrite || final ? { metadata_patch: {
             another_one_run: runId,
             another_one_presets: owner.slots.map((s) => s.presetId),
+            preset_contexts: owner.slots.map((slot, i) => ({
+              preset_id: slot.presetId,
+              another_one_swipe_id: swipeIds[i],
+              ...variableState ? { variables: variableState.slots[i].snapshot } : {}
+            })),
             ...variableState ? {
-              another_one_variables: { ...variableState, slots: variableState.slots.map(({ snapshot: _, ...slot }) => slot) },
-              preset_contexts: variableState.slots.map((slot) => ({ preset_id: slot.presetId, variables: slot.snapshot }))
+              another_one_variables: { ...variableState, slots: variableState.slots.map(({ snapshot: _, ...slot }) => slot) }
             } : {}
           } } : {}
         };
@@ -874,13 +880,26 @@ async function findSwipe(run, stepIndex, message) {
     throw new Error("This reply is no longer available.");
   }
   const expected = step.swipe ?? stepIndex;
-  if (step.contentHash) {
-    const hashes = await Promise.all(message.swipes.map((s) => typeof s === "string" ? contentHash(s) : null));
-    if (message.swipes.length === run.steps.length && hashes[expected] === step.contentHash)
-      return expected;
-    const matches = hashes.flatMap((hash, index) => hash === step.contentHash ? [index] : []);
+  const contexts = message.extra.spindle_metadata.preset_contexts;
+  if (step.swipeId) {
+    const matches = Array.isArray(contexts) ? contexts.flatMap((context, i) => context?.another_one_swipe_id === step.swipeId && context.preset_id === step.presetId && i < message.swipes.length ? [i] : []) : [];
     if (matches.length === 1)
       return matches[0];
+    throw new Error("This swipe is no longer available.");
+  }
+  if (step.contentHash) {
+    const hashes = await Promise.all(message.swipes.map((s) => typeof s === "string" ? contentHash(s) : null));
+    const samePreset = (i) => !Array.isArray(contexts) || contexts[i]?.preset_id === step.presetId;
+    if (message.swipes.length === run.steps.length && samePreset(expected) && hashes[expected] === step.contentHash)
+      return expected;
+    const matches = hashes.flatMap((hash, index) => samePreset(index) && hash === step.contentHash ? [index] : []);
+    if (matches.length === 1)
+      return matches[0];
+    if (Array.isArray(contexts) && run.steps.filter((s) => s.presetId === step.presetId).length === 1) {
+      const candidates = contexts.flatMap((context, i) => context?.preset_id === step.presetId && i < message.swipes.length ? [i] : []);
+      if (candidates.length === 1)
+        return candidates[0];
+    }
     throw new Error("This swipe was edited or deleted. Open it using the chat's swipe arrows.");
   }
   if (message.swipes.length === run.steps.length && typeof message.swipes[expected] === "string" && message.swipes[expected])
@@ -1028,7 +1047,13 @@ async function selectedVariables(message) {
     return;
   let index = message.swipe_id;
   let slot = data.slots[index];
-  if (context?.variables) {
+  if (context?.another_one_swipe_id) {
+    const matches = data.slots.flatMap((value, i) => value.swipeId === context.another_one_swipe_id && value.presetId === context.preset_id ? [i] : []);
+    if (matches.length !== 1)
+      throw new Error("This swipe's original variable state is no longer available.");
+    index = matches[0];
+    slot = data.slots[index];
+  } else if (context?.variables) {
     const snapshot = context.variables;
     const baseline = keyedChanges(data.slots.flatMap((value) => value.changes));
     const matches = data.slots.flatMap((value, i) => {
@@ -1173,7 +1198,9 @@ class Forks {
         const hash = await contentHash(content);
         const expected = original?.steps[index];
         const matches = original?.steps.filter((s) => s.presetId === presetId && s.contentHash === hash);
-        const prior = original?.steps.length === message.swipes.length && expected?.presetId === presetId && (!expected.contentHash || expected.contentHash === hash) ? expected : matches?.length === 1 ? matches[0] : undefined;
+        const swipeId = contexts?.[index]?.another_one_swipe_id;
+        const identities = original?.steps.filter((s) => s.swipeId === swipeId && s.presetId === presetId);
+        const prior = swipeId ? identities?.length === 1 ? identities[0] : undefined : original?.steps.length === message.swipes.length && expected?.presetId === presetId && (!expected.contentHash || expected.contentHash === hash) ? expected : matches?.length === 1 ? matches[0] : undefined;
         const data = message.metadata.another_one_variables;
         const unfinished = !prior && data?.slots.some((s) => s.presetId === presetId && !s.contentHash);
         if (!names.has(presetId))
@@ -1184,6 +1211,7 @@ class Forks {
           connectionName: prior?.connectionName ?? "Copied reply",
           status: unfinished || prior?.status === "running" || prior?.status === "waiting" ? "stopped" : prior?.status ?? "done",
           swipe: index,
+          swipeId: contexts?.[index]?.another_one_swipe_id,
           contentHash: hash,
           ...prior?.error ? { error: prior.error } : {}
         };
