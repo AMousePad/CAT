@@ -5,6 +5,7 @@ import { isLumiRealmPreset } from "./preset-support";
 interface Capture {
   user: string; chatId: string; runId: string; sourceId: string;
   before: Pick<VariableSnapshot, "global" | "chat">;
+  revision: string | null;
 }
 
 /** Native dry-run snapshots preserve the preset's own blocks, bindings and regexes. */
@@ -16,7 +17,7 @@ export class VariableCapture {
     if (!source || !chat) throw new Error("The preset or chat is no longer available.");
     if (isLumiRealmPreset(source)) throw new Error("LumiRealm presets are not supported. Choose a native Lumiverse preset.");
     const token = crypto.randomUUID();
-    this.captures.set(token, { user, chatId, runId, sourceId, before: persistentVariables(chat.metadata) });
+    this.captures.set(token, { user, chatId, runId, sourceId, before: persistentVariables(chat.metadata), revision: (chat as { variable_revision?: string }).variable_revision ?? null });
     return { token, presetId: sourceId };
   }
   async finish(user: string, runId: string, sourceId: string, token: string, state?: VariableSnapshot): Promise<SwipeVariables> {
@@ -34,8 +35,9 @@ export class VariableCapture {
       };
       const chat = await this.api.chats.get(capture.chatId, user);
       const latest = chat && persistentVariables(chat.metadata);
-      if (!latest || variableChanges(capture.before, { local: {}, ...latest }).length) throw new Error("Chat variables changed while prompts were preparing. Send again to use the updated values.");
-      return { presetId: sourceId, changes: variableChanges(capture.before, snapshot), local: snapshot.local, snapshot };
+      if (!latest || variableChanges(capture.before, { local: {}, ...latest }).length || ((chat as { variable_revision?: string }).variable_revision ?? null) !== capture.revision)
+        throw new Error("Chat variables changed while prompts were preparing. Send again to use the updated values.");
+      return { presetId: sourceId, changes: variableChanges(capture.before, snapshot), local: snapshot.local, snapshot, before: capture.before, revision: capture.revision };
     } finally { this.captures.delete(token); }
   }
   async cancel(user: string, runId: string) {

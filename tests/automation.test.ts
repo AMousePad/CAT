@@ -21,7 +21,7 @@ function fixture(savedStorage?: Storage, variables?: ConstructorParameters<typeo
     chats: { get: async (id: string) => ({ id, name: "Chat", metadata: id === "fork" ? { branched_from: "chat" } : {} }) },
     presets: { getActive: async () => { throw new Error('Unrecognized message type: "presets_get_active"'); } },
     memories: { chatMemory: { warm: async () => ({ status: "skipped" }) } },
-    chat: { getMessages: () => read(), updateMessage: async (_c: string, id: string, patch: { swipes: string[]; metadata?: object; metadata_patch?: object }) => {
+    chat: { getMessages: () => read(), setSwipeVariables: async () => true, updateMessage: async (_c: string, id: string, patch: { swipes: string[]; metadata?: object; metadata_patch?: object }) => {
       writes.push(patch.swipes);
       const message = messages.find(m => m.id === id);
       if (message && patch.metadata) message.metadata = patch.metadata;
@@ -75,7 +75,8 @@ test("swipe identities retain asynchronously captured variables and reject faile
   for (const fail of [false, true]) {
     const snapshot = { local: { mode: "one" }, global: {}, chat: { counter: "1" } };
     const variables = { capture: { create: async () => ({ token: "token", presetId: "p" }), cancel: async () => {},
-      finish: async () => { await Bun.sleep(1); if (fail) throw new Error("Capture failed"); return { presetId: "p", changes: [], local: snapshot.local, snapshot }; } },
+      finish: async () => { await Bun.sleep(1); if (fail) throw new Error("Capture failed"); return { presetId: "p", changes: [], local: snapshot.local, snapshot,
+        before: { global: snapshot.global, chat: snapshot.chat }, revision: null }; } },
       selection: { sync: async () => {} } } as unknown as ConstructorParameters<typeof Automation>[5];
     const f = fixture(undefined, variables); await f.arm(); await f.context();
     f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });

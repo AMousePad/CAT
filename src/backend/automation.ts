@@ -287,10 +287,20 @@ export class Automation {
             preset_contexts: owner.slots.map((slot, i) => ({ preset_id: slot.presetId, another_one_swipe_id: swipeIds[i],
               ...(variableState ? { variables: variableState.slots[i].snapshot } : {}) })),
             ...(variableState ? {
-              another_one_variables: { ...variableState, slots: variableState.slots.map(({ snapshot: _, ...slot }) => slot) },
+              another_one_variables: { ...variableState, slots: variableState.slots.map(({ snapshot: _, before: _before, revision: _revision, ...slot }) => slot) },
             } : {}) } } : {}) };
         await this.api.chat.updateMessage(owner.chatId, messageId, patch);
-        if (firstWrite || final) await this.variables?.selection.sync(user, owner.chatId);
+        if (firstWrite && variableState) {
+          const source = variableState.slots[0];
+          if (!source.before || variableState.slots.some(slot => !slot.snapshot || slot.revision !== source.revision || JSON.stringify(slot.before) !== JSON.stringify(source.before)))
+            throw new Error("The prepared swipes do not share the same variable state. Send again.");
+          type Values = NonNullable<typeof source.before>;
+          const chat = this.api.chat as SpindleAPI["chat"] & { setSwipeVariables(chatId: string, messageId: string,
+            input: { expected_variables: Values; expected_revision: string | null; expected_swipes: string[]; variables: Values[] }): Promise<boolean> };
+          if (!await chat.setSwipeVariables(owner.chatId, messageId, { expected_variables: source.before, expected_revision: source.revision ?? null,
+            expected_swipes: swipes, variables: variableState.slots.map(slot => ({ global: slot.snapshot!.global, chat: slot.snapshot!.chat })) }))
+            throw new Error("Chat variables changed before streaming started. Send again to use the updated values.");
+        }
         firstWrite = false;
         // The final snapshot may equal the last partial write. Explicitly warm
         // once so memory chunks do not remain indexed from an earlier token.

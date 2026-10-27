@@ -31,6 +31,7 @@ async function loadCatalog(userId: string, chatId?: string) {
   if (!spindle.host.capabilities["chat-metadata-patch-v1"]) throw new Error("Update Lumiverse to a build with message metadata patch support before enabling CAT.");
   if (!spindle.host.capabilities["generation-request-messages-v1"]) throw new Error("Update Lumiverse to a build with prepared request messages before enabling CAT.");
   if (!spindle.host.capabilities["chat-conditional-metadata-v1"]) throw new Error("Update Lumiverse to a build with conditional chat metadata updates before enabling CAT.");
+  if (!spindle.host.capabilities["chat-swipe-variables-v1"]) throw new Error("Update Lumiverse to a build with per-swipe variable support before enabling CAT.");
   const presets = await listSourcePresets(spindle.presets, userId);
   const [settings, connections, history, activation] = await Promise.all([storage.settings(userId), spindle.connections.list(userId), chatId ? storage.history(userId, chatId) : [], storage.activation(userId)]);
   return { settings, history, activation, presets, connections: connections.map(c => ({ id: c.id, name: c.name, model: c.model })) };

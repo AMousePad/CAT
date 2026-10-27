@@ -34,6 +34,7 @@ const requests: any[] = [];
 const results: string[] = [];
 const session = crypto.randomUUID().replaceAll("-", "");
 const replies = new Map<string, Reply>();
+const generationEvents: Array<{ event: string; payload: any }> = [];
 const provider = Bun.serve({ port: port + 1, hostname: "127.0.0.1", async fetch(req) {
   if (req.method === "GET") return Response.json({ data: [{ id: "fixture-main" }, { id: "fixture-alt" }] });
   const body = await req.json() as any;
@@ -92,6 +93,7 @@ try {
     socket = new BunWebSocket(`ws://localhost:${port}/api/ws?frontend_session=${frontendSession}`, { headers: { Cookie: cookie, Origin: origin } });
     socket.addEventListener("message", event => {
       const msg = JSON.parse(String(event.data));
+      if (msg.event?.startsWith("GENERATION_") || msg.event === "STREAM_TOKEN_RECEIVED") generationEvents.push(msg);
       if (msg.event !== "SPINDLE_FRONTEND_MSG") return;
       const data = msg.payload.data;
       if (data.type === "reply") replies.set(data.id, data);
@@ -344,7 +346,7 @@ try {
     assert.equal(message.swipe_id, sourceMessages[index].swipe_id);
     assert.deepEqual(message.extra.spindle_metadata?.preset_contexts, sourceMessages[index].extra.spindle_metadata?.preset_contexts);
   }
-  assert.equal((await api(`/api/v1/chats/${latestFork.id}`)).metadata.another_one_applied_variables.messageId, copied.at(-1).id);
+  assert.equal((await api(`/api/v1/chats/${latestFork.id}`)).metadata._swipe_variable_state.messageId, copied.at(-1).id);
   const forkHistory = (await rpc("load", { chatId: latestFork.id })).history.filter(r => r.chatId === latestFork.id);
   const lastRun = forkHistory.find(r => r.messageId === copied.at(-1).id)!;
   assert(lastRun);
@@ -503,6 +505,55 @@ try {
   await rpc("preparationFailed", { runId: cancelled.runId, chatId: repeatFork.id, messageId: abandoned.id, error: "Stopped" });
   assert(!(await api(`/api/v1/chats/${repeatFork.id}/messages?full=true`)).data.some((m: any) => m.id === abandoned.id));
   pass("a blank reply created after cancellation is removed without creating a swipe entry");
+  const variablesChat = await api("/api/v1/chats", "POST", { character_id: character.id, name: "Variable history verification" });
+  await rpc("save", { settings: { version: 1, cats: false, slots: [0, 1].map(i => ({ id: `variables-${i}`, presetId: presets[i].id, connectionId: connection.id })) } });
+  await rpc("arm", { chatId: variablesChat.id, connectionId: connection.id });
+  const variableReplies: string[] = [];
+  for (let turn = 0; turn < 3; turn++) {
+    const id = await begin(`VARIABLE_TURN_${turn}`, variablesChat.id); variableReplies.push(id);
+    await until("variable reply finished", () => view, v => v?.phase === "ready" && v.run?.messageId === id);
+  }
+  const count = async () => (await api(`/api/v1/chats/${variablesChat.id}`)).metadata.chat_variables.ao_probe_counter;
+  assert.equal(await count(), "3");
+  await api(`/api/v1/chats/${variablesChat.id}/messages/bulk-delete`, "POST", { message_ids: variableReplies.slice(1) });
+  assert.equal(await count(), "1");
+  await api(`/api/v1/chats/${variablesChat.id}/messages/${variableReplies[0]}/swipe`, "POST", { direction: "right" });
+  assert.equal(await count(), "10");
+  await api(`/api/v1/chats/${variablesChat.id}/messages/${variableReplies[0]}/swipe`, "POST", { direction: "left" });
+  assert.equal(await count(), "1");
+  pass("bulk deletion restores the surviving reply's variables before observers run and its alternate still selects correctly");
+  await rpc("disarm", { stop: true });
+  const nativeEventStart = generationEvents.length;
+  await api("/api/v1/generate/regenerate", "POST", { chat_id: variablesChat.id, message_id: variableReplies[0], connection_id: connection.id,
+    preset_id: presets[0].id, force_preset_id: true });
+  await until("native variable generation finished", () => generationEvents.slice(nativeEventStart), events => events.some(e => e.event === "GENERATION_ENDED" && e.payload.chatId === variablesChat.id));
+  assert.equal(await count(), "2");
+  for (const [direction, expected] of [["left", "10"], ["left", "1"], ["right", "10"], ["right", "2"]]) {
+    await api(`/api/v1/chats/${variablesChat.id}/messages/${variableReplies[0]}/swipe`, "POST", { direction });
+    assert.equal(await count(), expected);
+  }
+  pass("native regeneration owns its prompt and response variables alongside CAT swipes without stale state or repeated counters");
+  for (const stopEarly of [false, true]) {
+    const generationId = crypto.randomUUID();
+    const eventStart = generationEvents.length;
+    const beforeIds = new Set((await api(`/api/v1/chats/${variablesChat.id}/messages?full=true`)).data.map((m: any) => m.id));
+    const beforeCount = await count();
+    tokenDelay = stopEarly ? 90 : 5;
+    await api("/api/v1/generate", "POST", { chat_id: variablesChat.id, connection_id: connection.id,
+      generationId, preset_id: presets[0].id, force_preset_id: true });
+    if (stopEarly) {
+      await until("late reply streaming", () => api(`/api/v1/generate/status/${variablesChat.id}`), status => status.generationId === generationId && status.content?.includes("word1"));
+      await api("/api/v1/generate/stop", "POST", { generation_id: generationId });
+    }
+    await until("late reply settled", () => generationEvents.slice(eventStart), events => events.some(e => ["GENERATION_ENDED", "GENERATION_STOPPED"].includes(e.event) && e.payload.generationId === generationId));
+    const created = (await api(`/api/v1/chats/${variablesChat.id}/messages?full=true`)).data.filter((m: any) => !beforeIds.has(m.id));
+    assert.equal(created.length, 1);
+    assert(created[0].extra.variableStateBySwipe[0]?.id);
+    assert.equal(await count(), String(Number(beforeCount) + 1));
+    await api(`/api/v1/chats/${variablesChat.id}/messages/${created[0].id}`, "DELETE");
+    assert.equal(await count(), beforeCount);
+  }
+  pass("late-created native replies own prompt effects on completion and stop, and deletion restores the preceding reply");
   if (installedProbes) {
     const { auditInstalledPresets } = await import("./installed-presets");
     await auditInstalledPresets(host, api, chat.id, connection.id, user.id, await fromHost("services/regex-scripts.service.ts"), pass, installedProbes);

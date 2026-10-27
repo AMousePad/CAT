@@ -87,6 +87,7 @@ export class Forks {
     const messages = await this.api.chat.getMessages(chatId);
     const branchId = messages[0]?.branch_id;
     if (branchId) await restoreRunHistory(this.api, this.storage, user, chat, messages.filter(m => m.branch_id === branchId));
+    if (messages.some(m => Array.isArray(m.extra?.variableStateBySwipe) && m.extra.variableStateBySwipe.some(Boolean))) return;
     for (let attempt = 0; attempt < 5; attempt++) if (await this.initializeVariables(user, chatId)) return;
     throw new Error("The fork kept changing while restoring its variables. Try again.");
   }

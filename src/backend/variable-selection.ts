@@ -38,6 +38,7 @@ export class VariableSelection {
   private async apply(user: string, chatId: string) {
     const messages = await this.api.chat.getMessages(chatId);
     const target = [...messages].reverse().find(m => m.role === "assistant");
+    if (target && Array.isArray(target.extra?.variableStateBySwipe) && target.extra.variableStateBySwipe[target.swipe_id]) return true;
     const selected = target && await selectedVariables(target);
     const chat = await this.api.chats.get(chatId, user);
     if (!chat) return true;

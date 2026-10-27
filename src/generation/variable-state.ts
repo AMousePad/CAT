@@ -4,7 +4,8 @@ export interface VariableSnapshot {
   prompt_selections?: Record<string, string[]>; prompt_defaults?: VariableMap;
 }
 export interface VariableChange { scope: "global" | "chat"; key: string; before: string | null; after: string | null }
-export interface SwipeVariables { presetId: string; changes: VariableChange[]; local: VariableMap; swipeId?: string; contentHash?: string; snapshot?: VariableSnapshot }
+export interface SwipeVariables { presetId: string; changes: VariableChange[]; local: VariableMap; swipeId?: string; contentHash?: string; snapshot?: VariableSnapshot;
+  before?: Pick<VariableSnapshot, "global" | "chat">; revision?: string | null }
 export interface MessageVariables { version: 1; slots: SwipeVariables[] }
 export interface AppliedVariables { messageId: string; changes: VariableChange[] }
 

@@ -789,13 +789,24 @@ class Automation {
               ...variableState ? { variables: variableState.slots[i].snapshot } : {}
             })),
             ...variableState ? {
-              another_one_variables: { ...variableState, slots: variableState.slots.map(({ snapshot: _, ...slot }) => slot) }
+              another_one_variables: { ...variableState, slots: variableState.slots.map(({ snapshot: _, before: _before, revision: _revision, ...slot }) => slot) }
             } : {}
           } } : {}
         };
         await this.api.chat.updateMessage(owner.chatId, messageId, patch);
-        if (firstWrite || final)
-          await this.variables?.selection.sync(user, owner.chatId);
+        if (firstWrite && variableState) {
+          const source = variableState.slots[0];
+          if (!source.before || variableState.slots.some((slot) => !slot.snapshot || slot.revision !== source.revision || JSON.stringify(slot.before) !== JSON.stringify(source.before)))
+            throw new Error("The prepared swipes do not share the same variable state. Send again.");
+          const chat = this.api.chat;
+          if (!await chat.setSwipeVariables(owner.chatId, messageId, {
+            expected_variables: source.before,
+            expected_revision: source.revision ?? null,
+            expected_swipes: swipes,
+            variables: variableState.slots.map((slot) => ({ global: slot.snapshot.global, chat: slot.snapshot.chat }))
+          }))
+            throw new Error("Chat variables changed before streaming started. Send again to use the updated values.");
+        }
         firstWrite = false;
         if (final) {
           try {
@@ -1013,7 +1024,7 @@ class VariableCapture {
     if (isLumiRealmPreset(source))
       throw new Error("LumiRealm presets are not supported. Choose a native Lumiverse preset.");
     const token = crypto.randomUUID();
-    this.captures.set(token, { user, chatId, runId, sourceId, before: persistentVariables(chat.metadata) });
+    this.captures.set(token, { user, chatId, runId, sourceId, before: persistentVariables(chat.metadata), revision: chat.variable_revision ?? null });
     return { token, presetId: sourceId };
   }
   async finish(user, runId, sourceId, token, state) {
@@ -1035,9 +1046,9 @@ class VariableCapture {
       };
       const chat = await this.api.chats.get(capture.chatId, user);
       const latest = chat && persistentVariables(chat.metadata);
-      if (!latest || variableChanges(capture.before, { local: {}, ...latest }).length)
+      if (!latest || variableChanges(capture.before, { local: {}, ...latest }).length || (chat.variable_revision ?? null) !== capture.revision)
         throw new Error("Chat variables changed while prompts were preparing. Send again to use the updated values.");
-      return { presetId: sourceId, changes: variableChanges(capture.before, snapshot), local: snapshot.local, snapshot };
+      return { presetId: sourceId, changes: variableChanges(capture.before, snapshot), local: snapshot.local, snapshot, before: capture.before, revision: capture.revision };
     } finally {
       this.captures.delete(token);
     }
@@ -1219,6 +1230,8 @@ class Forks {
     const branchId = messages[0]?.branch_id;
     if (branchId)
       await restoreRunHistory(this.api, this.storage, user, chat, messages.filter((m) => m.branch_id === branchId));
+    if (messages.some((m) => Array.isArray(m.extra?.variableStateBySwipe) && m.extra.variableStateBySwipe.some(Boolean)))
+      return;
     for (let attempt = 0;attempt < 5; attempt++)
       if (await this.initializeVariables(user, chatId))
         return;
@@ -1372,6 +1385,8 @@ class VariableSelection {
   async apply(user, chatId) {
     const messages = await this.api.chat.getMessages(chatId);
     const target = [...messages].reverse().find((m) => m.role === "assistant");
+    if (target && Array.isArray(target.extra?.variableStateBySwipe) && target.extra.variableStateBySwipe[target.swipe_id])
+      return true;
     const selected = target && await selectedVariables(target);
     const chat = await this.api.chats.get(chatId, user);
     if (!chat)
@@ -1470,6 +1485,8 @@ async function loadCatalog(userId, chatId) {
     throw new Error("Update Lumiverse to a build with prepared request messages before enabling CAT.");
   if (!spindle.host.capabilities["chat-conditional-metadata-v1"])
     throw new Error("Update Lumiverse to a build with conditional chat metadata updates before enabling CAT.");
+  if (!spindle.host.capabilities["chat-swipe-variables-v1"])
+    throw new Error("Update Lumiverse to a build with per-swipe variable support before enabling CAT.");
   const presets = await listSourcePresets(spindle.presets, userId);
   const [settings, connections, history, activation] = await Promise.all([storage.settings(userId), spindle.connections.list(userId), chatId ? storage.history(userId, chatId) : [], storage.activation(userId)]);
   return { settings, history, activation, presets, connections: connections.map((c) => ({ id: c.id, name: c.name, model: c.model })) };
