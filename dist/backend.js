@@ -190,6 +190,9 @@ class Leases {
   }
 }
 
+// src/generation/managed.ts
+var managedGenerate = (api) => api.generate;
+
 // src/generation/preset-context.ts
 var PRESET_CHANGE_NOTE = "Note: Your instructions have changed, ensure you only generate prose-adjacent items that are **currently** specified. Do not generate structures based on past messages.";
 function usesMultiplePresets(messages, presetIds) {
@@ -230,6 +233,7 @@ class ParallelRun {
   writeError;
   externallyChanged = false;
   snapshots = new Set;
+  finishing = false;
   constructor(record, prompts, driver, flushMs = 120) {
     this.record = record;
     this.prompts = prompts;
@@ -268,6 +272,8 @@ class ParallelRun {
     return task;
   }
   observeEdit(swipes, extra = {}) {
+    if (this.finishing)
+      return;
     const texts = Array.isArray(extra.reasoningBySwipe) ? extra.reasoningBySwipe : [];
     const durations = Array.isArray(extra.reasoningDurationBySwipe) ? extra.reasoningDurationBySwipe : [];
     const reasoning = swipes.map((_, index) => ({ text: texts[index] || null, duration: durations[index] ?? null }));
@@ -276,8 +282,8 @@ class ParallelRun {
     this.externallyChanged = true;
     this.stop("The reply was edited or its swipes changed. Streaming stopped to preserve your changes.");
   }
-  stop(detail = "Stopped. Partial replies have been kept.") {
-    this.record.detail = detail;
+  stop(detail) {
+    this.record.detail = detail ?? this.record.detail ?? "Stopped. Partial replies have been kept.";
     this.abort.abort();
   }
   observeDeletion() {
@@ -302,6 +308,8 @@ class ParallelRun {
         step.status = "running";
         this.emit();
         let content = "";
+        this.swipes[index] = prompt.prefill || "";
+        this.dirty = true;
         let done = false;
         const reasoning = this.reasoning[index];
         let reasoningStartedAt;
@@ -344,6 +352,8 @@ class ParallelRun {
             step.swipe = index;
           }
         } catch (error) {
+          if (error instanceof Error && error.name === "AbortError")
+            this.stop();
           step.status = this.abort.signal.aborted ? "stopped" : "error";
           if (step.status === "error")
             step.error = errorText(error);
@@ -358,6 +368,17 @@ class ParallelRun {
       clearInterval(this.timer);
     }
     await this.flush(true);
+    this.finishing = true;
+    if (this.driver.finalize) {
+      try {
+        const saved = await this.driver.finalize();
+        this.swipes.splice(0, this.swipes.length, ...saved.swipes);
+        this.reasoning.splice(0, this.reasoning.length, ...saved.reasoning);
+      } catch (error) {
+        this.writeError ??= errorText(error);
+        this.abort.abort();
+      }
+    }
     await Promise.all(this.record.steps.map(async (step, index) => {
       step.swipe = index;
       if (this.swipes[index])
@@ -545,7 +566,30 @@ class Automation {
         await this.variables.capture.cancel(user, runId);
         throw new Error("These swipes were cancelled.");
       }
-      return value;
+      const slot = owner.slots[index];
+      const result = await managedGenerate(this.api).dryRun({
+        chatId: owner.chatId,
+        connectionId: slot.connectionId,
+        presetId: value.presetId,
+        forcePresetId: true,
+        includeRequestMessages: true,
+        retainResponseContext: true,
+        personaId: owner.preparation?.personaId,
+        generationType: "normal"
+      }, user);
+      if (!result.responseContextId || !Array.isArray(result.request_messages))
+        throw new Error("Update Lumiverse to a build with managed message generation before using CAT.");
+      return { ...value, prompt: {
+        connectionId: slot.connectionId,
+        captureToken: value.token,
+        responseContextId: result.responseContextId,
+        variableState: result.variable_state,
+        messages: result.request_messages,
+        parameters: result.parameters,
+        provider: result.provider,
+        model: result.model,
+        prefill: result.assistantPrefill || ""
+      } };
     });
     owner.prepared.set(index, work);
     return work;
@@ -670,6 +714,10 @@ class Automation {
   started(p, user) {
     this.active.set(`${user}:${p.chatId}`, p);
     const owner = this.owners.get(user);
+    if (p.renderMode === "persisted-message" && owner?.current && owner.current.record.messageId === p.targetMessageId) {
+      owner.managedId = p.generationId;
+      return;
+    }
     if (!owner?.armed || owner.switching || p.chatId !== owner.chatId)
       return;
     if (p.frontendSessionId !== owner.session && p.generationType === "normal" && !owner.current && !owner.preparation)
@@ -684,6 +732,10 @@ class Automation {
     if (this.active.get(`${user}:${p.chatId}`)?.generationId === p.generationId)
       this.active.delete(`${user}:${p.chatId}`);
     const owner = this.owners.get(user);
+    if (owner?.managedId === p.generationId) {
+      owner.current?.stop();
+      return;
+    }
     if (!owner || owner.parent?.generationId !== p.generationId)
       return;
     owner.parent = undefined;
@@ -767,7 +819,9 @@ class Automation {
           model: typeof model === "string" && model.trim() ? model.trim() : prompt.model,
           messages: withPresetNote(prompt.messages, mixedPresets),
           parameters,
-          signal
+          signal,
+          sessionId: owner.managedId,
+          swipeIndex: prompts.indexOf(prompt)
         };
         return this.api.generate.rawStream(request);
       },
@@ -794,27 +848,45 @@ class Automation {
           } } : {}
         };
         await this.api.chat.updateMessage(owner.chatId, messageId, patch);
-        if (firstWrite && variableState) {
-          const source = variableState.slots[0];
-          if (!source.before || variableState.slots.some((slot) => !slot.snapshot || slot.revision !== source.revision || JSON.stringify(slot.before) !== JSON.stringify(source.before)))
-            throw new Error("The prepared swipes do not share the same variable state. Send again.");
-          const chat = this.api.chat;
-          if (!await chat.setSwipeVariables(owner.chatId, messageId, {
-            expected_variables: source.before,
-            expected_revision: source.revision ?? null,
-            expected_swipes: swipes,
-            variables: variableState.slots.map((slot) => ({ global: slot.snapshot.global, chat: slot.snapshot.chat }))
-          }))
-            throw new Error("Chat variables changed before streaming started. Send again to use the updated values.");
+        if (firstWrite) {
+          if (prompts.some((prompt) => !prompt.responseContextId))
+            throw new Error("The prepared response context is missing.");
+          const session = await managedGenerate(this.api).beginMessage({
+            chatId: owner.chatId,
+            messageId,
+            responseContextIds: prompts.map((prompt) => prompt.responseContextId),
+            userId: user,
+            frontendSessionId: owner.session
+          });
+          owner.managedId = session.id;
+          run.abort.signal.addEventListener("abort", () => {
+            managedGenerate(this.api).abortMessage(session.id).catch(() => {});
+          }, { once: true });
+          if (run.abort.signal.aborted)
+            await managedGenerate(this.api).abortMessage(session.id);
         }
         firstWrite = false;
-        if (final) {
-          try {
-            await this.api.memories.chatMemory.warm(owner.chatId, { userId: user, force: true });
-          } catch (error) {
-            run.record.detail = `Replies saved; chat memory refresh failed: ${errorText(error)}`;
-          }
+      },
+      finalize: async () => {
+        if (owner.managedId) {
+          const result = await managedGenerate(this.api).finishMessage(owner.managedId);
+          if (!result.completed)
+            run.stop();
         }
+        const saved = (await this.api.chat.getMessages(owner.chatId)).find((message) => message.id === messageId);
+        if (!saved) {
+          run.observeDeletion();
+          return { swipes: run.swipes, reasoning: run.reasoning };
+        }
+        try {
+          await this.api.memories.chatMemory.warm(owner.chatId, { userId: user, force: true });
+        } catch (error) {
+          run.record.detail = `Replies saved; chat memory refresh failed: ${errorText(error)}`;
+        }
+        return { swipes: saved.swipes, reasoning: saved.swipes.map((_, index) => ({
+          text: saved.extra.reasoningBySwipe?.[index] ?? null,
+          duration: saved.extra.reasoningDurationBySwipe?.[index] ?? null
+        })) };
       },
       changed: (record) => {
         owner.view.run = run.deleted ? null : record;
@@ -826,6 +898,7 @@ class Automation {
       if (!run.deleted)
         await this.storage.record(user, record);
       owner.current = undefined;
+      owner.managedId = undefined;
       if (owner.switching)
         return;
       if (record.outcome === "complete" && owner.armed)
@@ -1475,6 +1548,8 @@ for (const event of ["GENERATION_ENDED", "GENERATION_STOPPED"])
       active.delete(key);
   });
 async function loadCatalog(userId, chatId) {
+  if (!spindle.host.capabilities["generation-message-sessions-v1"])
+    throw new Error("Update Lumiverse to a build with managed message generation before enabling CAT.");
   if (!spindle.host.capabilities["message-preset-context-v1"])
     throw new Error("CAT requires a Lumiverse build with per-swipe preset support. Update Lumiverse before enabling CAT.");
   if (!spindle.host.capabilities["chat-swipe-reasoning-v1"])

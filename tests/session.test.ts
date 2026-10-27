@@ -12,11 +12,17 @@ function fixture() {
   let follow: () => Promise<any> = async () => ({ phase: "ready", detail: "Ready", run: null });
   let arm = async () => ({ phase: "ready", detail: "", run: null });
   let receive: (raw: unknown) => void = () => {};
+  let prepare: (input: any) => Promise<any> = async input => {
+    const slot = catalog.settings.slots[input.stepIndex];
+    return { presetId: slot.presetId, token: `capture-${input.stepIndex}`, prompt: { responseContextId: `context-${input.stepIndex}`,
+      captureToken: `capture-${input.stepIndex}`, connectionId: slot.connectionId || "main", messages: [{ role: "user", content: "Hi" }],
+      parameters: {}, provider: "custom", model: "fixture" } };
+  };
   const bridge = { call: async (operation: string, input: any) => {
     calls.push({ operation, input });
     if (operation === "followFork") return follow();
     if (operation === "selectSwipe" || operation === "launch" || operation === "preparationFailed") return true;
-    if (operation === "preparePreset") return { presetId: catalog.settings.slots[input.stepIndex].presetId, token: `capture-${input.stepIndex}` };
+    if (operation === "preparePreset") return prepare(input);
     if (operation === "arm") return arm();
     if (operation === "disarm") return disarm();
     throw new Error(`Unexpected operation: ${operation}`);
@@ -30,7 +36,7 @@ function fixture() {
     } } },
   } as unknown as SpindleFrontendContext;
   const catalog: Catalog = { settings: { version: 1, cats: false, slots: [{ id: "slot", presetId: "source", connectionId: null }] }, presets: [{ id: "source", name: "Source" }], connections: [{ id: "main", name: "Main" }] };
-  return { state, actions, catalog, calls, setDisarm: (fn: typeof disarm) => { disarm = fn; }, setArm: (fn: typeof arm) => { arm = fn; }, setFollow: (fn: typeof follow) => { follow = fn; }, receive: (raw: unknown) => receive(raw), make: () => new Session(ctx, bridge, () => {}) };
+  return { state, actions, catalog, calls, setPrepare: (fn: typeof prepare) => { prepare = fn; }, setDisarm: (fn: typeof disarm) => { disarm = fn; }, setArm: (fn: typeof arm) => { arm = fn; }, setFollow: (fn: typeof follow) => { follow = fn; }, receive: (raw: unknown) => receive(raw), make: () => new Session(ctx, bridge, () => {}) };
 }
 
 test("Stop cancels backend streams and keeps the composer busy through the final save", async () => {
@@ -130,40 +136,30 @@ test("a restored backend session prepares the next send; disconnect and unload n
   expect(f.calls.map(c => c.operation)).toEqual(["disarm"]);
 });
 
-test("parallel prompts use each profile's preset and variables while the user's manual selection stays unchanged", async () => {
+test("backend-prepared media and variable snapshots reach launch unchanged without changing the user's preset", async () => {
   const f = fixture(), session = f.make(), previousFetch = globalThis.fetch;
   f.catalog.settings.slots.push({ id: "second", presetId: "second-source", connectionId: "alternate" });
-  const selectedAtRequest: string[] = [];
-  const dryRuns: any[] = [];
-  globalThis.fetch = (async (url: string, options: RequestInit) => {
-    selectedAtRequest.push(f.state.preset);
-    if (!url.includes("dry-run")) return Response.json({ id: "reply" });
-    const body = JSON.parse(String(options.body)); dryRuns.push(body);
-    return Response.json({ messages: [{ role: "system", content: "Display-only text" }], request_messages: [{ role: "system", content: body.preset_id },
-      { role: "user", content: [{ type: "audio", data: "UklGRg==", mime_type: "audio/wav" }] },
-      { role: "assistant", content: "Reply", reasoning_content: "Thought", thinking_blocks: [{ type: "thinking", thinking: "Signed", signature: "signature" }] }], parameters: {}, provider: "custom", model: body.connection_id,
-      variable_state: { local: { tone: body.preset_id }, global: {}, chat: {} } });
-  }) as typeof fetch;
+  const prepared: any[] = [];
+  f.setPrepare(async input => {
+    const slot = f.catalog.settings.slots[input.stepIndex];
+    const prompt = { responseContextId: `context-${input.stepIndex}`, captureToken: `capture-${input.stepIndex}`,
+      connectionId: slot.connectionId || "main", parameters: {}, provider: "custom", model: slot.connectionId || "main",
+      messages: [{ role: "user", content: [{ type: "audio", data: "UklGRg==", mime_type: "audio/wav" }] },
+        { role: "assistant", content: "Reply", reasoning_content: "Thought", thinking_blocks: [{ type: "thinking", thinking: "Signed", signature: "signature" }] }],
+      variableState: { local: { tone: slot.presetId }, global: {}, chat: {} } };
+    prepared.push(prompt); return { token: prompt.captureToken, presetId: slot.presetId, prompt };
+  });
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: string) => { urls.push(url); return Response.json({ id: "reply" }); }) as typeof fetch;
   try {
     await session.enable(f.catalog); f.state.preset = "manually-selected";
-    expect(session.armed).toBe(true);
     f.receive({ type: "prepare", runId: "run", chatId: "chat", name: "Cat", slots: [
       { presetId: "source", connectionId: "main" }, { presetId: "second-source", connectionId: "alternate" },
     ] });
     await Bun.sleep(5);
-    expect(selectedAtRequest).toEqual(["manually-selected", "manually-selected", "manually-selected"]);
-    expect(dryRuns.map(r => [r.preset_id, r.connection_id, r.force_preset_id])).toEqual([
-      ["source", "main", true], ["second-source", "alternate", true],
-    ]);
-    const prompts = f.calls.find(c => c.operation === "launch")!.input.prompts;
-    expect(dryRuns.every(request => request.include_request_messages === true)).toBe(true);
-    expect(prompts[0].messages).toEqual([{ role: "system", content: "source" },
-      { role: "user", content: [{ type: "audio", data: "UklGRg==", mime_type: "audio/wav" }] },
-      { role: "assistant", content: "Reply", reasoning_content: "Thought", thinking_blocks: [{ type: "thinking", thinking: "Signed", signature: "signature" }] }]);
-    expect(prompts.map((p: any) => p.variableState.local.tone)).toEqual(["source", "second-source"]);
-    expect(prompts.map((p: any) => [p.provider, p.model])).toEqual([["custom", "main"], ["custom", "alternate"]]);
-    expect(f.actions).toEqual([]);
-    await session.disable(); expect(f.state.preset).toBe("manually-selected");
+    expect(f.calls.find(call => call.operation === "launch")!.input.prompts).toEqual(prepared);
+    expect(urls).toEqual(["/api/v1/chats/chat/messages"]);
+    expect(f.state.preset).toBe("manually-selected"); expect(f.actions).toEqual([]);
   } finally { globalThis.fetch = previousFetch; await session.dispose(); }
 });
 
@@ -176,17 +172,17 @@ test("opening a fork keeps the session enabled without switching the user's pres
   await session.disable(); expect(f.state.preset).toBe("source"); await session.dispose();
 });
 
-test("a host without prepared messages fails before creating a reply or sending provider requests", async () => {
+test("an incomplete backend preparation fails before creating a reply", async () => {
   const f = fixture(), session = f.make(), previousFetch = globalThis.fetch;
+  f.setPrepare(async () => ({ token: "capture", presetId: "source", prompt: { messages: [] } }));
   const urls: string[] = [];
-  globalThis.fetch = (async (url: string) => { urls.push(url); return Response.json({ messages: [{ role: "user", content: "Display text" }] }); }) as typeof fetch;
+  globalThis.fetch = (async (url: string) => { urls.push(url); return Response.json({ id: "reply" }); }) as typeof fetch;
   try {
     await session.enable(f.catalog);
     f.receive({ type: "prepare", runId: "run", chatId: "chat", name: "Cat", slots: [{ presetId: "source", connectionId: "main" }] });
     await Bun.sleep(5);
-    expect(urls).toHaveLength(1); expect(urls[0]).toContain("dry-run");
-    expect(f.calls.some(call => call.operation === "launch")).toBe(false);
-    expect(f.calls.find(call => call.operation === "preparationFailed")?.input.error).toContain("prepared request messages");
+    expect(urls).toHaveLength(0); expect(f.calls.some(call => call.operation === "launch")).toBe(false);
+    expect(f.calls.find(call => call.operation === "preparationFailed")?.input.error).toContain("incomplete");
   } finally { globalThis.fetch = previousFetch; await session.dispose(); }
 });
 

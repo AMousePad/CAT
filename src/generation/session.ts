@@ -109,11 +109,8 @@ export class Session {
       const prompts: PreparedPrompt[] = await Promise.all(message.slots.map(async (slot, stepIndex) => {
         const prepared = await this.bridge.call("preparePreset", { runId: message.runId, stepIndex });
         if (abort.signal.aborted) throw new Error("Cancelled while preparing swipes.");
-        const value = await hostRequest("generate/dry-run", { chat_id: message.chatId, connection_id: slot.connectionId,
-          preset_id: prepared.presetId, force_preset_id: true, include_request_messages: true, persona_id: message.personaId, generation_type: "normal" }, abort.signal);
-        if (!Array.isArray(value.request_messages)) throw new Error("Update Lumiverse to a build with prepared request messages before using CAT.");
-        return { connectionId: slot.connectionId, captureToken: prepared.token, variableState: value.variable_state, messages: value.request_messages,
-          parameters: value.parameters, provider: value.provider, model: value.model, prefill: value.assistantPrefill || "" };
+        if (!prepared.prompt?.responseContextId || !Array.isArray(prepared.prompt.messages)) throw new Error("The prepared request is incomplete.");
+        return prepared.prompt;
       }));
       if (abort.signal.aborted || !this.armed || this.driver.chatId() !== message.chatId) return;
       creatingReply = true;

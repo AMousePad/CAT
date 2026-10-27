@@ -177,9 +177,8 @@ try {
         assert(!JSON.stringify(portable).includes(source.prompt_order[0].content));
         assert.deepEqual(copy.metadata._lumiverse_sealed_preset, source.metadata._lumiverse_sealed_preset);
       }
-      const dry = await api("/api/v1/generate/dry-run", "POST", { chat_id: targetChatId, connection_id: s.connectionId, preset_id: capture.presetId, force_preset_id: true, include_request_messages: true, generation_type: "normal" });
       assert.deepEqual(await api(`/api/v1/presets/${s.presetId}`), source, "preparing must not modify the source preset");
-      return { messages: dry.request_messages, parameters: dry.parameters, provider: dry.provider, model: dry.model, connectionId: s.connectionId, prefill: dry.assistantPrefill, captureToken: capture.token, variableState: dry.variable_state };
+      return capture.prompt;
     }));
     const reply = await api(`/api/v1/chats/${targetChatId}/messages`, "POST", { is_user: false, name: prepared.name, content: "", extra: { character_id: character.id, spindle_metadata: { another_one_run: prepared.runId } } });
     await rpc("launch", { runId: prepared.runId, messageId: reply.id, prompts });
@@ -554,6 +553,55 @@ try {
     assert.equal(await count(), beforeCount);
   }
   pass("late-created native replies own prompt effects on completion and stop, and deletion restores the preceding reply");
+  const lifecycleChat = await api("/api/v1/chats", "POST", { character_id: character.id, name: "Completion verification" });
+  for (const [index, preset] of presets.slice(0, 2).entries()) {
+    const rule = await api("/api/v1/regex-scripts", "POST", { name: `Response ${index}`, preset_id: preset.id,
+      target: ["response"], placement: ["ai_output", "reasoning"], find_regex: "word30|thought3", replace_string: `FINAL_${index}` });
+    await api(`/api/v1/regex-scripts/${rule.id}/toggle`, "PUT", { disabled: false, active_preset_id: preset.id });
+  }
+  const { eventBus } = await fromHost("ws/bus.ts");
+  const chatsService = await fromHost("services/chats.service.ts");
+  const observed: any[] = [];
+  const unsubscribe = eventBus.on("GENERATION_ENDED", (event: any) => {
+    if (event.payload.chatId === lifecycleChat.id) observed.push(structuredClone({ payload: event.payload,
+      message: chatsService.getMessage(user.id, event.payload.messageId) }));
+  });
+  tokenDelay = 20;
+  for (const [failure, selected, expectedCompletions] of [[false, 1, 1], [true, 0, 1], [true, 1, 0]] as const) {
+    failB = failure; await rpc("arm", { chatId: lifecycleChat.id, connectionId: connection.id });
+    const before = observed.length;
+    const id = await begin("COMPLETION_CHECK", lifecycleChat.id);
+    const status = await until("managed session started", () => api(`/api/v1/generate/status/${lifecycleChat.id}`), s => s.active && s.targetMessageId === id);
+    assert.equal(status.renderMode, "persisted-message"); assert.equal(status.targetMessageId, id);
+    if (selected) await api(`/api/v1/chats/${lifecycleChat.id}/messages/${id}/swipe`, "POST", { direction: "right" });
+    await until("completion check settled", () => view, v => v?.run?.messageId === id && v?.phase !== "running");
+    assert.equal(observed.length - before, expectedCompletions);
+    if (expectedCompletions) {
+      const event = observed.at(-1); assert.equal(event.message.swipe_id, selected);
+      assert.equal(event.payload.content, event.message.content);
+      assert(event.message.content.includes(`FINAL_${selected}`));
+      assert(event.message.extra.reasoning.includes(`FINAL_${selected}`));
+      assert.equal(event.message.extra.reasoningCarrier.type, "reasoning_content");
+      assert(event.message.extra.reasoningCarrier.content.includes("thought3"));
+    }
+  }
+  pass("completion listeners run once on the selected successful reply after response regexes, reasoning and native carriers are saved");
+  failB = false; firstTokenDelay = 1500;
+  for (const restart of [false, true]) {
+    await rpc("arm", { chatId: lifecycleChat.id, connectionId: connection.id });
+    const before = observed.length;
+    const id = await begin("STOP_BEFORE_FIRST_TOKEN", lifecycleChat.id);
+    const status = await until("managed session started before stop", () => api(`/api/v1/generate/status/${lifecycleChat.id}`), s => s.active && s.targetMessageId === id);
+    if (restart) await api(`/api/v1/spindle/${extension.id}/restart`, "POST", {});
+    else assert.equal((await api("/api/v1/generate/stop", "POST", { generation_id: status.generationId })).stopped, true);
+    await until("native busy state cleared", () => api(`/api/v1/generate/status/${lifecycleChat.id}`), s => !s.active);
+    await Bun.sleep(1600);
+    assert.equal((await api(`/api/v1/generate/status/${lifecycleChat.id}`)).active, false);
+    assert.equal(observed.length, before, "Stopping or restarting must not report a completed reply");
+    assert.equal(chatsService.getMessage(user.id, id).content, "");
+  }
+  firstTokenDelay = 0; unsubscribe();
+  pass("native Stop and worker restart cancel requests before the first token without stuck streaming or successful completion events");
   if (installedProbes) {
     const { auditInstalledPresets } = await import("./installed-presets");
     await auditInstalledPresets(host, api, chat.id, connection.id, user.id, await fromHost("services/regex-scripts.service.ts"), pass, installedProbes);

@@ -26,6 +26,7 @@ for (const event of ["GENERATION_ENDED", "GENERATION_STOPPED"] as const) spindle
 });
 
 async function loadCatalog(userId: string, chatId?: string) {
+  if (!spindle.host.capabilities["generation-message-sessions-v1"]) throw new Error("Update Lumiverse to a build with managed message generation before enabling CAT.");
   if (!spindle.host.capabilities["message-preset-context-v1"]) throw new Error("CAT requires a Lumiverse build with per-swipe preset support. Update Lumiverse before enabling CAT.");
   if (!spindle.host.capabilities["chat-swipe-reasoning-v1"]) throw new Error("Update Lumiverse to a build with per-swipe reasoning support before enabling CAT.");
   if (!spindle.host.capabilities["chat-metadata-patch-v1"]) throw new Error("Update Lumiverse to a build with message metadata patch support before enabling CAT.");

@@ -7,7 +7,7 @@ export interface Preparation {
   mixedPresets?: boolean;
 }
 export interface Operations {
-  preparePreset: { input: { runId: string; stepIndex: number }; output: { token: string; presetId: string } };
+  preparePreset: { input: { runId: string; stepIndex: number }; output: { token: string; presetId: string; prompt: PreparedPrompt } };
   load: { input: { chatId?: string }; output: Catalog & { history: RunRecord[]; activation: Activation } };
   activation: { input: ActivationPatch; output: Activation };
   save: { input: { settings: Settings }; output: Settings };

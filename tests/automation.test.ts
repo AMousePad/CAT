@@ -24,11 +24,20 @@ function fixture(savedStorage?: Storage, variables?: ConstructorParameters<typeo
     chat: { getMessages: () => read(), setSwipeVariables: async () => true, updateMessage: async (_c: string, id: string, patch: { swipes: string[]; metadata?: object; metadata_patch?: object }) => {
       writes.push(patch.swipes);
       const message = messages.find(m => m.id === id);
+      if (message) {
+        message.swipes = patch.swipes;
+        const reasoning = (patch as any).swipe_reasoning;
+        message.extra = { ...message.extra, reasoningBySwipe: reasoning?.map((r: any) => r.text), reasoningDurationBySwipe: reasoning?.map((r: any) => r.duration) };
+      }
       if (message && patch.metadata) message.metadata = patch.metadata;
       if (message && patch.metadata_patch) message.metadata = { ...message.metadata, ...patch.metadata_patch };
     },
       deleteMessage: async (_c: string, id: string) => { deleted.push(id); } },
-    generate: { rawStream: async function* (request: { signal: AbortSignal }) {
+    generate: {
+      dryRun: async () => ({ responseContextId: "context", request_messages: [{ role: "user", content: "Hi" }], parameters: {}, provider: "custom", model: "fixture" }),
+      beginMessage: async () => ({ id: "managed" }), abortMessage: async () => {},
+      finishMessage: async () => ({ messageId: "reply", completed: false }),
+      rawStream: async function* (request: { signal: AbortSignal }) {
       const { signal } = request; generated.push(request);
       yield { type: "token", token: "partial" };
       await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
@@ -63,7 +72,7 @@ test("final streaming writes preserve metadata added by another extension", asyn
   const prep = f.sent.find(s => s.type === "prepare");
   const message = { id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } as Record<string, unknown> };
   f.setMessages([message]);
-  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", provider: "custom", model: "fixture" }]);
+  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", responseContextId: "context", provider: "custom", model: "fixture" }]);
   await Bun.sleep(5);
   message.metadata.other_extension = { value: "written during streaming" };
   await f.automation.disarm("user", "session", true);
@@ -84,7 +93,7 @@ test("swipe identities retain asynchronously captured variables and reject faile
     await f.automation.preparePreset("user", "session", prep.runId, 0);
     const message = { id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } as Record<string, any> };
     f.setMessages([message]);
-    const launch = f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], captureToken: "token", parameters: {}, connectionId: "c", provider: "custom", model: "fixture" }]);
+    const launch = f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], captureToken: "token", parameters: {}, connectionId: "c", responseContextId: "context", provider: "custom", model: "fixture" }]);
     if (fail) { await expect(launch).rejects.toThrow("Capture failed"); expect(f.generated).toHaveLength(0); }
     else {
       await launch; await Bun.sleep(5);
@@ -105,7 +114,7 @@ test("a settled run remains protected from history recovery until its final save
   let finish!: () => void, writing!: () => void;
   const entered = new Promise<void>(resolve => { writing = resolve; });
   f.storage.record = async () => { writing(); await new Promise<void>(resolve => { finish = resolve; }); };
-  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", provider: "custom", model: "fixture" }]);
+  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", responseContextId: "context", provider: "custom", model: "fixture" }]);
   const stopping = f.automation.disarm("user", "session", true);
   await entered;
   expect(f.automation.getRun("user", prep.runId)?.outcome).toBe("stopped");
@@ -154,7 +163,7 @@ test("following a fork stops source streams before transferring ownership and ke
   await f.context(); f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
   const prep = f.sent.find(s => s.type === "prepare");
   f.setMessages([{ id: "reply", index_in_chat: 12, name: "Mio", role: "assistant", content: "", metadata: { another_one_run: prep.runId } }]);
-  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", provider: "custom", model: "fixture" }]);
+  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", responseContextId: "context", provider: "custom", model: "fixture" }]);
   await Bun.sleep(5);
   const view = await f.automation.followFork("user", "session", "fork");
   expect(view?.phase).toBe("ready"); expect(f.records[0].chatId).toBe("chat"); expect(f.records[0].outcome).toBe("stopped");
@@ -172,7 +181,7 @@ test("deleting a streaming reply clears its view and prevents a late history ent
   await f.context(); f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
   const prep = f.sent.find(s => s.type === "prepare");
   f.setMessages([{ id: "reply", index_in_chat: 12, name: "Mio", role: "assistant", content: "", metadata: { another_one_run: prep.runId } }]);
-  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", provider: "custom", model: "fixture" }]);
+  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", responseContextId: "context", provider: "custom", model: "fixture" }]);
   await Bun.sleep(5);
   const writes = f.writes.length;
   f.setMessages([]); f.emit("MESSAGE_DELETED", { chatId: "chat", messageId: "reply" });
@@ -189,10 +198,10 @@ test("prepared model overrides reach raw streaming without mutating the prepared
   const prep = f.sent.find(s => s.type === "prepare");
   f.setMessages([{ id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } }]);
   const parameters = { model: " selected-model ", temperature: 0.7 };
-  await f.automation.launch("user", "session", prep.runId, "reply", [{ connectionId: "c", provider: "custom", model: "connection-model", parameters,
+  await f.automation.launch("user", "session", prep.runId, "reply", [{ connectionId: "c", responseContextId: "context", provider: "custom", model: "connection-model", parameters,
     messages: [{ role: "user", content: "Hi" }] }]);
   await Bun.sleep(0);
-  expect(f.generated[0]).toMatchObject({ type: "raw", connection_id: "c", provider: "custom", model: "selected-model", parameters: { temperature: 0.7 } });
+  expect(f.generated[0]).toMatchObject({ type: "raw", connection_id: "c", sessionId: "managed", swipeIndex: 0, provider: "custom", model: "selected-model", parameters: { temperature: 0.7 } });
   expect(f.generated[0].parameters).not.toHaveProperty("model");
   expect(parameters.model).toBe(" selected-model ");
   await f.automation.disarm("user", "session", true);
@@ -294,7 +303,7 @@ test("native swipe navigation keeps streams alive; deleting a swipe stops furthe
   f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
   const prep = f.sent.find(s => s.type === "prepare");
   f.setMessages([{ id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } }]);
-  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", provider: "custom", model: "fixture" }]);
+  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", responseContextId: "context", provider: "custom", model: "fixture" }]);
   await Bun.sleep(5);
   f.emit("MESSAGE_SWIPED", { action: "navigated", message: { id: "reply", swipes: ["partial"] } });
   expect(f.records).toHaveLength(0);

@@ -81,7 +81,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   };
   try {
     controller = new Session(ctx, bridge, view => {
-      composerStop.update(controller.generatingChatId);
+      composerStop.update(controller.view.phase === "preparing" ? controller.generatingChatId : null);
       waitingCat.update(view);
       if (view.run && view.run.outcome !== "running") history = [structuredClone(view.run), ...history.filter(r => r.id !== view.run!.id)].slice(0, 20);
       notice.textContent = view.phase === "error" && selected !== "swipes" ? view.detail : "";
@@ -199,7 +199,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     }),
     ctx.events.on("__ws_close", () => controller.disconnected()),
     ctx.events.on("CONNECTED", raw => { if ((raw as { role?: string }).role) { void load(); restoreContexts(); } }),
-    ctx.state!.subscribe("chat.active", () => { messages.clear(); waitingCat.update(null); composerStop.update(controller.generatingChatId); void controller.chatChanged(); render(); restoreContexts(); }),
+    ctx.state!.subscribe("chat.active", () => { messages.clear(); waitingCat.update(null); composerStop.update(controller.view.phase === "preparing" ? controller.generatingChatId : null); void controller.chatChanged(); render(); restoreContexts(); }),
     ctx.events.on("MESSAGE_SENT", messageChanged), ctx.events.on("MESSAGE_DELETED", raw => {
       const event = raw as { chatId: string; messageId: string };
       history = history.filter(run => run.chatId !== event.chatId || run.messageId !== event.messageId);

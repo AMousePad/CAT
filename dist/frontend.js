@@ -190,27 +190,9 @@ class Session {
         const prepared = await this.bridge.call("preparePreset", { runId: message.runId, stepIndex });
         if (abort.signal.aborted)
           throw new Error("Cancelled while preparing swipes.");
-        const value = await hostRequest("generate/dry-run", {
-          chat_id: message.chatId,
-          connection_id: slot.connectionId,
-          preset_id: prepared.presetId,
-          force_preset_id: true,
-          include_request_messages: true,
-          persona_id: message.personaId,
-          generation_type: "normal"
-        }, abort.signal);
-        if (!Array.isArray(value.request_messages))
-          throw new Error("Update Lumiverse to a build with prepared request messages before using CAT.");
-        return {
-          connectionId: slot.connectionId,
-          captureToken: prepared.token,
-          variableState: value.variable_state,
-          messages: value.request_messages,
-          parameters: value.parameters,
-          provider: value.provider,
-          model: value.model,
-          prefill: value.assistantPrefill || ""
-        };
+        if (!prepared.prompt?.responseContextId || !Array.isArray(prepared.prompt.messages))
+          throw new Error("The prepared request is incomplete.");
+        return prepared.prompt;
       }));
       if (abort.signal.aborted || !this.armed || this.driver.chatId() !== message.chatId)
         return;
@@ -352,7 +334,7 @@ class Bridge {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error("CAT's backend did not respond. Check the connection and extension permissions."));
-      }, 20000);
+      }, operation === "preparePreset" ? 120000 : 20000);
       this.pending.set(id, { resolve: (value) => resolve(value), reject, timer });
       try {
         this.ctx.sendToBackend({ type: "request", id, operation, input });
@@ -1795,7 +1777,7 @@ function setup(ctx) {
   };
   try {
     controller = new Session(ctx, bridge, (view) => {
-      composerStop.update(controller.generatingChatId);
+      composerStop.update(controller.view.phase === "preparing" ? controller.generatingChatId : null);
       waitingCat.update(view);
       if (view.run && view.run.outcome !== "running")
         history = [structuredClone(view.run), ...history.filter((r) => r.id !== view.run.id)].slice(0, 20);
@@ -2021,7 +2003,7 @@ function setup(ctx) {
     ctx.state.subscribe("chat.active", () => {
       messages.clear();
       waitingCat.update(null);
-      composerStop.update(controller.generatingChatId);
+      composerStop.update(controller.view.phase === "preparing" ? controller.generatingChatId : null);
       controller.chatChanged();
       render();
       restoreContexts();

@@ -20,7 +20,7 @@ export class Bridge {
     if (this.disposed) return Promise.reject(new Error("Extension unloaded."));
     const id = randomId();
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error("CAT's backend did not respond. Check the connection and extension permissions.")); }, 20_000);
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error("CAT's backend did not respond. Check the connection and extension permissions.")); }, operation === "preparePreset" ? 120_000 : 20_000);
       this.pending.set(id, { resolve: value => resolve(value as Operations[K]["output"]), reject, timer });
       try { this.ctx.sendToBackend({ type: "request", id, operation, input }); }
       catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }

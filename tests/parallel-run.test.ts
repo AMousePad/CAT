@@ -60,6 +60,20 @@ test("an external message edit stops writes instead of replacing the user's chan
   const count = writes.length; run.observeEdit(["User edited this reply", "1", "2"]);
   expect((await result).outcome).toBe("stopped"); expect(writes).toHaveLength(count);
 });
+
+test("host cancellation arriving before the stopped event is a normal stop, not a provider error", async () => {
+  const run = new ParallelRun(record(), prompts, {
+    async *stream(prompt, signal) {
+      yield { type: "token", token: "partial" };
+      if (prompt.connectionId === "0") throw new DOMException("Generation aborted", "AbortError");
+      if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+    }, write: async () => {}, changed: () => {},
+  });
+  const result = await run.run();
+  expect(result.outcome).toBe("stopped");
+  expect(result.steps.every(step => step.status === "stopped" && !step.error)).toBe(true);
+  expect(run.swipes).toEqual(["partial", "partial", "partial"]);
+});
 test("a persistence error aborts the streams and is surfaced", async () => {
   let starts = 0;
   const run = new ParallelRun(record(), prompts, {
