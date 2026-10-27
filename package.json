@@ -1,0 +1,27 @@
+{
+  "name": "cat",
+  "version": "egetables were devoured",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "packageManager": "bun@1.4.4",
+  "engines": { "bun": ">=1.4.4" },
+  "scripts": {
+    "build:backend": "bun build src/backend.ts --outfile dist/backend.js --target bun",
+    "build:frontend": "bun build src/frontend.ts --outfile dist/frontend.js --target browser",
+    "build": "bun run typecheck && bun run build:backend && bun run build:frontend",
+    "deploy": "powershell.exe -NoProfile -File scripts/deploy.ps1",
+    "package": "bun scripts/package.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./tests",
+    "test:host": "bun scripts/test-host.ts",
+    "preview": "bun scripts/test-host.ts ../Lumiverse --serve"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "fflate": "0.8.3",
+    "happy-dom": "^21.0.4",
+    "lumiverse-spindle-types": "0.6.59",
+    "typescript": "^5.9.3"
+  }
+}

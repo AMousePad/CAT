@@ -1,0 +1,13 @@
+{
+  "identifier": "another_one",
+  "name": "Concurrent Alternate Trajectories",
+  "version": "egetables were devoured",
+  "author": "AMousePad",
+  "github": "https://github.com/AMousePad/CAT",
+  "homepage": "https://github.com/AMousePad/CAT",
+  "description": "Generate parallel swipes using your chosen presets and connections, with each swipe individually retaining the regex rendering from the chosen preset.",
+  "permissions": ["generation", "presets", "chats", "chat_mutation", "memories", "context_handler", "event_tracking"],
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js",
+  "minimum_lumiverse_version": "1.3.0"
+}

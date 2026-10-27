@@ -1,0 +1,9 @@
+node_modules/
+local/
+*.log
+tsconfig.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example
+*.zip

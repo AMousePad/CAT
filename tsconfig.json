@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "target": "ESNext", "module": "ESNext", "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"], "strict": true,
+    "skipLibCheck": true, "noEmit": true, "types": ["bun"],
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"]
+}
