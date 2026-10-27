@@ -21,7 +21,12 @@ function fixture(savedStorage?: Storage) {
     chats: { get: async (id: string) => ({ id, name: "Chat", metadata: id === "fork" ? { branched_from: "chat" } : {} }) },
     presets: { getActive: async () => { throw new Error('Unrecognized message type: "presets_get_active"'); } },
     memories: { chatMemory: { warm: async () => ({ status: "skipped" }) } },
-    chat: { getMessages: () => read(), updateMessage: async (_c: string, _m: string, patch: { swipes: string[] }) => { writes.push(patch.swipes); },
+    chat: { getMessages: () => read(), updateMessage: async (_c: string, id: string, patch: { swipes: string[]; metadata?: object; metadata_patch?: object }) => {
+      writes.push(patch.swipes);
+      const message = messages.find(m => m.id === id);
+      if (message && patch.metadata) message.metadata = patch.metadata;
+      if (message && patch.metadata_patch) message.metadata = { ...message.metadata, ...patch.metadata_patch };
+    },
       deleteMessage: async (_c: string, id: string) => { deleted.push(id); } },
     generate: { rawStream: async function* (request: { signal: AbortSignal }) {
       const { signal } = request; generated.push(request);
@@ -51,6 +56,20 @@ function fixture(savedStorage?: Storage) {
     setCouncil: (fn: typeof council) => { council = fn; },
     setRead: (fn: typeof read) => { read = fn; }, setMessages: (value: any[]) => { messages = value; } };
 }
+
+test("final streaming writes preserve metadata added by another extension", async () => {
+  const f = fixture(); await f.arm(); await f.context();
+  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
+  const prep = f.sent.find(s => s.type === "prepare");
+  const message = { id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } as Record<string, unknown> };
+  f.setMessages([message]);
+  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", provider: "custom", model: "fixture" }]);
+  await Bun.sleep(5);
+  message.metadata.other_extension = { value: "written during streaming" };
+  await f.automation.disarm("user", "session", true);
+  expect(message.metadata.other_extension).toEqual({ value: "written during streaming" });
+  expect(message.metadata.another_one_presets).toEqual(["p"]);
+});
 
 test("disabling during enable cancels ownership; concurrent enable attempts cannot race", async () => {
   const f = fixture();

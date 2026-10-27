@@ -194,6 +194,10 @@ try {
   assert.equal(live.id, replyId); assert.equal(active, 3);
   assert.deepEqual(live.extra.spindle_metadata.another_one_presets, presets.map(p => p.id));
   const liveRun = view!.run!;
+  const messageService = await fromHost("services/chats.service.ts");
+  const concurrentMessage = messageService.getMessage(user.id, replyId);
+  messageService.updateMessage(user.id, replyId, { extra: { ...concurrentMessage.extra,
+    spindle_metadata: { ...concurrentMessage.extra.spindle_metadata, other_extension: { value: "written during streaming" } } } });
   assert.equal(await rpc("selectSwipe", { runId: liveRun.id, stepIndex: 2 }), true);
   assert.equal((await api(`/api/v1/chats/${chat.id}/messages?full=true`)).data.at(-1).swipe_id, 2);
   await rpc("selectSwipe", { runId: liveRun.id, stepIndex: 0 });
@@ -203,6 +207,8 @@ try {
   await until("completed set", () => view, v => v?.phase === "ready" && v.run?.outcome === "complete");
   assert.equal(requests.length, 3, "the replaced native generation must not send an extra model request");
   const saved = (await api(`/api/v1/chats/${chat.id}/messages?full=true`)).data.at(-1);
+  assert.deepEqual(saved.extra.spindle_metadata.other_extension, { value: "written during streaming" });
+  pass("final stream writes retain metadata added by another extension");
   assert.equal(saved.id, replyId); assert.equal(saved.name, "Miso");
   assert.equal(saved.swipe_id, 1, "stream writes must preserve the user's selected swipe");
   assert.deepEqual(saved.extra.reasoningBySwipe, [..."ABC"].map(marker => [1, 2, 3].map(i => `PRESET_${marker} thought${i} `).join("")));

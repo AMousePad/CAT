@@ -27,6 +27,7 @@ for (const event of ["GENERATION_ENDED", "GENERATION_STOPPED"] as const) spindle
 async function loadCatalog(userId: string) {
   if (!spindle.host.capabilities["message-preset-context-v1"]) throw new Error("CAT requires a Lumiverse build with per-swipe preset support. Update Lumiverse before enabling CAT.");
   if (!spindle.host.capabilities["chat-swipe-reasoning-v1"]) throw new Error("Update Lumiverse to a build with per-swipe reasoning support before enabling CAT.");
+  if (!spindle.host.capabilities["chat-metadata-patch-v1"]) throw new Error("Update Lumiverse to a build with message metadata patch support before enabling CAT.");
   const presets = await listSourcePresets(spindle.presets, userId);
   const [settings, connections, history, activation] = await Promise.all([storage.settings(userId), spindle.connections.list(userId), storage.history(userId), storage.activation(userId)]);
   return { settings, history, activation, presets, connections: connections.map(c => ({ id: c.id, name: c.name, model: c.model })) };

@@ -240,13 +240,11 @@ export class Automation {
     let chatName: string;
     let messageIndex: number;
     let characterName: string;
-    let metadata: Record<string, unknown> = {};
     let variableState: MessageVariables | undefined;
     try {
       const messages = await this.api.chat.getMessages(owner.chatId);
       const last = messages.at(-1);
       if (last?.id !== messageId || last.role !== "assistant" || last.content || last.metadata?.another_one_run !== runId) throw new Error("The conversation changed before streaming could start.");
-      metadata = { ...last.metadata };
       messageIndex = last.index_in_chat;
       characterName = last.name;
       const inspection = await this.inspect(owner.chatId, user);
@@ -280,7 +278,7 @@ export class Automation {
       write: async (swipes, final, reasoning) => {
         if (final && variableState) await Promise.all(variableState.slots.map(async (slot, i) => { slot.contentHash = await contentHash(swipes[i]); }));
         const patch = { swipes, swipe_reasoning: reasoning, skipChunkRebuild: true,
-          ...(firstWrite || final ? { metadata: { ...metadata, another_one_run: runId, another_one_presets: owner.slots.map(s => s.presetId),
+          ...(firstWrite || final ? { metadata_patch: { another_one_run: runId, another_one_presets: owner.slots.map(s => s.presetId),
             ...(variableState ? {
               another_one_variables: { ...variableState, slots: variableState.slots.map(({ snapshot: _, ...slot }) => slot) },
               preset_contexts: variableState.slots.map(slot => ({ preset_id: slot.presetId, variables: slot.snapshot })),

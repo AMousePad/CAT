@@ -681,14 +681,12 @@ class Automation {
     let chatName;
     let messageIndex;
     let characterName;
-    let metadata = {};
     let variableState;
     try {
       const messages = await this.api.chat.getMessages(owner.chatId);
       const last = messages.at(-1);
       if (last?.id !== messageId || last.role !== "assistant" || last.content || last.metadata?.another_one_run !== runId)
         throw new Error("The conversation changed before streaming could start.");
-      metadata = { ...last.metadata };
       messageIndex = last.index_in_chat;
       characterName = last.name;
       const inspection = await this.inspect(owner.chatId, user);
@@ -755,8 +753,7 @@ class Automation {
           swipes,
           swipe_reasoning: reasoning,
           skipChunkRebuild: true,
-          ...firstWrite || final ? { metadata: {
-            ...metadata,
+          ...firstWrite || final ? { metadata_patch: {
             another_one_run: runId,
             another_one_presets: owner.slots.map((s) => s.presetId),
             ...variableState ? {
@@ -1361,6 +1358,8 @@ async function loadCatalog(userId) {
     throw new Error("CAT requires a Lumiverse build with per-swipe preset support. Update Lumiverse before enabling CAT.");
   if (!spindle.host.capabilities["chat-swipe-reasoning-v1"])
     throw new Error("Update Lumiverse to a build with per-swipe reasoning support before enabling CAT.");
+  if (!spindle.host.capabilities["chat-metadata-patch-v1"])
+    throw new Error("Update Lumiverse to a build with message metadata patch support before enabling CAT.");
   const presets = await listSourcePresets(spindle.presets, userId);
   const [settings, connections, history, activation] = await Promise.all([storage.settings(userId), spindle.connections.list(userId), storage.history(userId), storage.activation(userId)]);
   return { settings, history, activation, presets, connections: connections.map((c) => ({ id: c.id, name: c.name, model: c.model })) };
