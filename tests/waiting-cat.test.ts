@@ -37,7 +37,7 @@ const visible = () => document.querySelector(".ao-waiting-cat");
 
 test("empty active swipes show the spinning cat; reasoning, prose and completed slots hide it", async () => {
   const f = fixture(); const state = view(); indicator.update(state); await Bun.sleep(1);
-  expect(visible()?.textContent).toBe("Waiting For First Token...");
+  expect(visible()?.textContent?.trim()).toBe("Waiting For First Token...");
   expect(visible()?.getAttribute("role")).toBe("status");
   expect(visible()?.querySelector(".ao-wait-cat")?.getAttribute("aria-hidden")).toBe("true");
   const first = visible();
