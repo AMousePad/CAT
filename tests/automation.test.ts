@@ -96,6 +96,23 @@ test("swipe identities retain asynchronously captured variables and reject faile
   }
 });
 
+test("a settled run remains protected from history recovery until its final save finishes", async () => {
+  const f = fixture(); await f.arm(); await f.context();
+  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
+  const prep = f.sent.find(s => s.type === "prepare");
+  f.setMessages([{ id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } }]);
+  let finish!: () => void, writing!: () => void;
+  const entered = new Promise<void>(resolve => { writing = resolve; });
+  f.storage.record = async () => { writing(); await new Promise<void>(resolve => { finish = resolve; }); };
+  await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", provider: "custom", model: "fixture" }]);
+  const stopping = f.automation.disarm("user", "session", true);
+  await entered;
+  expect(f.automation.getRun("user", prep.runId)?.outcome).toBe("stopped");
+  expect(f.automation.isCurrentRun("user", prep.runId)).toBe(true);
+  finish(); await stopping; await Bun.sleep(0);
+  expect(f.automation.isCurrentRun("user", prep.runId)).toBe(false);
+});
+
 test("disabling during enable cancels ownership; concurrent enable attempts cannot race", async () => {
   const f = fixture();
   let finish!: (value: any) => void;

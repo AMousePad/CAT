@@ -1,7 +1,7 @@
 import type { SpindleAPI } from "lumiverse-spindle-types";
 import { contentHash } from "../generation/preset-context";
 import { applyVariableSelection, persistentVariables, variableChanges, type AppliedVariables, type MessageVariables, type VariableChange, type VariableSnapshot } from "../generation/variable-state";
-import { MAX_HISTORY, type RunRecord } from "../shared";
+import { restoreRunHistory } from "./run-history";
 import type { Storage } from "./storage";
 
 const keyedChanges = (changes: VariableChange[]) => new Map(changes.map(change => [`${change.scope}:${change.key}`, change]));
@@ -142,40 +142,7 @@ export class Forks {
         nextApplied = selected ? { messageId: last!.id, slot: selected.index, changes: selected.slot.changes } : undefined;
       }
     }
-    const history = await this.storage.history(user);
-    const runs: RunRecord[] = [];
-    const names = new Map<string, string>();
-    for (const message of copied.filter(m => m.metadata?.another_one_run).slice(-MAX_HISTORY)) {
-      if (!message.metadata) continue;
-      const id = `fork:${message.id}`;
-      const original = history.find(r => r.id === message.metadata!.another_one_run);
-      const contexts = message.metadata.preset_contexts as Array<{ preset_id: string; another_one_swipe_id?: string }> | undefined;
-      const presets = message.metadata.another_one_presets as string[] | undefined;
-      if (!Array.isArray(contexts) && !Array.isArray(presets)) continue;
-      const steps = await Promise.all(message.swipes.map(async (content, index) => {
-        const presetId = contexts?.[index]?.preset_id ?? presets?.[index] ?? "";
-        const hash = await contentHash(content);
-        const expected = original?.steps[index];
-        const matches = original?.steps.filter(s => s.presetId === presetId && s.contentHash === hash);
-        const swipeId = contexts?.[index]?.another_one_swipe_id;
-        const identities = original?.steps.filter(s => s.swipeId === swipeId && s.presetId === presetId);
-        const prior = swipeId ? (identities?.length === 1 ? identities[0] : undefined)
-          : original?.steps.length === message.swipes.length && expected?.presetId === presetId
-            && (!expected.contentHash || expected.contentHash === hash) ? expected : matches?.length === 1 ? matches[0] : undefined;
-        const data = message.metadata!.another_one_variables as MessageVariables | undefined;
-        const unfinished = !prior && data?.slots.some(s => s.presetId === presetId && !s.contentHash);
-        if (!names.has(presetId)) names.set(presetId, prior?.presetName ?? (await this.api.presets.get(presetId, user))?.name ?? "Deleted preset");
-        return { presetId, presetName: names.get(presetId)!, connectionName: prior?.connectionName ?? "Copied reply",
-          status: unfinished || prior?.status === "running" || prior?.status === "waiting" ? "stopped" as const : prior?.status ?? "done" as const,
-          swipe: index, swipeId: contexts?.[index]?.another_one_swipe_id, contentHash: hash, ...(prior?.error ? { error: prior.error } : {}) };
-      }));
-      const outcome = steps.some(s => s.status === "error") ? "error" : steps.some(s => s.status === "stopped") ? "stopped" : "complete";
-      runs.push({ id, chatId, chatName: chat.name, messageId: message.id, messageIndex: message.index_in_chat, characterName: message.name, at: original?.at ?? message.send_date * 1000, steps, outcome });
-      if (message.metadata.another_one_run !== id) {
-        await this.api.chat.updateMessage(chatId, message.id, { metadata: { ...message.metadata, another_one_run: id } });
-      }
-    }
-    await this.storage.recordMany(user, runs.reverse());
+    await restoreRunHistory(this.api, this.storage, user, chat, copied);
     // Fetch again so unrelated metadata changes during the copy are retained.
     const latest = await this.api.chats.get(chatId, user);
     if (!latest) return;

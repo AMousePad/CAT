@@ -137,10 +137,14 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   }
   async function load() {
     notice.replaceChildren();
+    const chatId = ctx.state!.get<{ chatId: string | null }>("chat.active").chatId;
+    const revision = contextRevision;
     try {
-      const next = await bridge.call("load", {});
+      const next = await bridge.call("load", { ...(chatId ? { chatId } : {}) });
       if (disposed) return;
-      catalog = next; history = next.history; applyActivation(next.activation); cat.setEnabled(next.settings.cats); if (opened) cat.show(); render(); hotbar?.update();
+      catalog = next;
+      if (revision === contextRevision && ctx.state!.get<{ chatId: string | null }>("chat.active").chatId === chatId) history = next.history;
+      applyActivation(next.activation); cat.setEnabled(next.settings.cats); if (opened) cat.show(); render(); hotbar?.update();
     } catch (error) {
       if (disposed) return;
       notice.textContent = errorText(error); notice.append(button("Retry", () => { void load(); }, "ao-small"));
@@ -172,9 +176,10 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   const restoreContexts = () => {
     const revision = ++contextRevision;
     const { chatId } = ctx.state!.get<{ chatId: string | null }>("chat.active");
-    if (chatId && ctx.host.capabilities["message-preset-context-v1"]) void bridge.call("restoreContexts", { chatId }).then(summaries => {
+    if (chatId && ctx.host.capabilities["message-preset-context-v1"]) void bridge.call("restoreContexts", { chatId }).then(result => {
       if (disposed || revision !== contextRevision || ctx.state!.get<{ chatId: string | null }>("chat.active").chatId !== chatId) return;
-      for (const [id, summary] of Object.entries(summaries)) messages.set(id, summary);
+      for (const [id, summary] of Object.entries(result.messages)) messages.set(id, summary);
+      history = result.history;
       render();
     }).catch(error => { if (!disposed && revision === contextRevision && ctx.state!.get<{ chatId: string | null }>("chat.active").chatId === chatId) notice.textContent = errorText(error); });
   };

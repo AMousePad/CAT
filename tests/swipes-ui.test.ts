@@ -42,8 +42,8 @@ test.each(["a", null])("the Swipes tab stays scoped through startup (%s), naviga
       if (request.operation === "load" && delayLoad) { heldLoad = request.id; return; }
       if (request.operation === "restoreContexts") {
         if (holdRestore) { heldRestore = request.id; return; }
-        receive({ type: "reply", id: request.id, value: Object.fromEntries(history.filter(r => r.chatId === request.input.chatId)
-          .map(r => [r.messageId, { index: r.messageIndex, name: "Mio" }])) }); return;
+        receive({ type: "reply", id: request.id, value: { history, messages: Object.fromEntries(history.filter(r => r.chatId === request.input.chatId)
+          .map(r => [r.messageId, { index: r.messageIndex, name: "Mio" }])) } }); return;
       }
       receive({ type: "reply", id: request.id, value: request.operation === "load" ? catalog() : { phase: "off", detail: "Disabled", run: null } });
     }),
@@ -60,6 +60,7 @@ test.each(["a", null])("the Swipes tab stays scoped through startup (%s), naviga
       show(currentB);
       expect(rows()).toEqual([]);
       navigate("a");
+      await Bun.sleep(2);
     }
     expect(rows()).toEqual(["a-latest", "a-past"]);
     expect(Array.from(root.querySelectorAll(".ao-run-title .ao-count"), el => el.textContent)).toEqual(["#12", "#0"]);
@@ -102,7 +103,7 @@ test.each(["a", null])("the Swipes tab stays scoped through startup (%s), naviga
       for (const callback of events.get("MESSAGE_DELETED")!) callback({ chatId: "a", messageId: id });
     };
     remove("a-past"); expect(rows()).toEqual(["a-latest"]);
-    receive({ type: "reply", id: heldRestore!, value: { "a-past": { index: 0, name: "Stale" } } }); await Bun.sleep(2);
+    receive({ type: "reply", id: heldRestore!, value: { history: [pastA], messages: { "a-past": { index: 0, name: "Stale" } } } }); await Bun.sleep(2);
     expect(rows()).toEqual(["a-latest"]);
     holdRestore = false;
     remove("a-latest"); expect(rows()).toEqual([]);

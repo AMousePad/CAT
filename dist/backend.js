@@ -48,8 +48,22 @@ class Storage {
     await this.locks.get(userId);
     return normalizeSettings(await this.read("settings.json", userId, null));
   }
-  history(userId) {
-    return this.read("history.json", userId, []);
+  historyPath(chatId) {
+    if (!/^[a-zA-Z0-9_-]{1,100}$/.test(chatId))
+      throw new Error("Invalid chat ID.");
+    return `history/${chatId}.json`;
+  }
+  async readHistory(userId, chatId) {
+    const path = this.historyPath(chatId);
+    if (await this.api.exists(path, userId))
+      return this.read(path, userId, []);
+    const legacy = await this.read("history.json", userId, []);
+    const history = legacy.filter((run) => run.chatId === chatId).slice(0, MAX_HISTORY);
+    await this.api.setJson(path, history, { userId, indent: 2 });
+    return history;
+  }
+  history(userId, chatId) {
+    return this.write(userId, () => this.readHistory(userId, chatId));
   }
   async activation(userId) {
     await this.locks.get(userId);
@@ -98,38 +112,45 @@ class Storage {
   }
   removeMessage(userId, chatId, messageId) {
     return this.write(userId, async () => {
-      const history = await this.history(userId);
+      const history = await this.readHistory(userId, chatId);
       const next = history.filter((run) => run.chatId !== chatId || run.messageId !== messageId);
       if (next.length === history.length)
         return false;
-      await this.api.setJson("history.json", next, { userId, indent: 2 });
+      await this.api.setJson(this.historyPath(chatId), next, { userId, indent: 2 });
       return true;
     });
   }
   reconcileHistory(userId, checked, messages) {
-    const byId = new Map(checked.map((run) => [run.id, run.messageId]));
     return this.write(userId, async () => {
-      const history = await this.history(userId);
-      const next = history.flatMap((run) => {
-        if (!byId.has(run.id) || byId.get(run.id) !== run.messageId)
-          return [run];
-        const message = messages[run.messageId];
-        return message ? [{ ...run, messageIndex: message.index, characterName: message.name }] : [];
-      });
-      if (JSON.stringify(next) !== JSON.stringify(history))
-        await this.api.setJson("history.json", next, { userId, indent: 2 });
+      for (const chatId of new Set(checked.map((run) => run.chatId))) {
+        const byId = new Map(checked.filter((run) => run.chatId === chatId).map((run) => [run.id, run.messageId]));
+        const history = await this.readHistory(userId, chatId);
+        const next = history.flatMap((run) => {
+          if (!byId.has(run.id) || byId.get(run.id) !== run.messageId)
+            return [run];
+          const message = messages[run.messageId];
+          return message ? [{ ...run, messageIndex: message.index, characterName: message.name }] : [];
+        });
+        if (JSON.stringify(next) !== JSON.stringify(history))
+          await this.api.setJson(this.historyPath(chatId), next, { userId, indent: 2 });
+      }
     });
   }
-  recordMany(userId, runs) {
+  recordMany(userId, runs, validate) {
     if (runs.some((run) => !run.messageId))
       return Promise.reject(new Error("A swipe entry must belong to a message."));
     if (!runs.length)
       return Promise.resolve();
     return this.write(userId, async () => {
-      const history = await this.history(userId);
-      const ids = new Set(runs.map((r) => r.id));
-      const next = [...runs, ...history.filter((r) => !ids.has(r.id))].slice(0, MAX_HISTORY);
-      await this.api.setJson("history.json", next, { userId, indent: 2 });
+      if (validate)
+        runs = await validate(runs);
+      for (const chatId of new Set(runs.map((run) => run.chatId))) {
+        const incoming = runs.filter((run) => run.chatId === chatId);
+        const history = await this.readHistory(userId, chatId);
+        const messages = new Set(incoming.map((run) => run.messageId));
+        const next = [...incoming, ...history.filter((run) => !messages.has(run.messageId))].slice(0, MAX_HISTORY);
+        await this.api.setJson(this.historyPath(chatId), next, { userId, indent: 2 });
+      }
     });
   }
 }
@@ -505,8 +526,12 @@ class Automation {
       this.owners.delete(owner.user);
   }
   getRun(user, runId) {
-    const run = this.owners.get(user)?.view.run;
+    const owner = this.owners.get(user);
+    const run = owner?.current?.record ?? owner?.view.run;
     return run?.id === runId ? structuredClone(run) : undefined;
+  }
+  isCurrentRun(user, runId) {
+    return this.owners.get(user)?.current?.record.id === runId;
   }
   preparePreset(user, session, runId, index) {
     const owner = this.owned(user, session);
@@ -626,7 +651,7 @@ class Automation {
       const inspection = await this.inspect(chatId, user);
       if (inspection.blockedReason || inspection.busy)
         throw new Error(inspection.blockedReason || "Wait for this chat's generation to finish.");
-      const history = await this.storage.history(user);
+      const history = await this.storage.history(user, chatId);
       if (!owner.armed || owner.navigation !== navigation || this.owners.get(user) !== owner || !this.leases.valid(user, session))
         return null;
       owner.chatId = chatId;
@@ -1024,6 +1049,70 @@ class VariableCapture {
   }
 }
 
+// src/backend/run-history.ts
+async function restoreRunHistory(api, storage, user, chat, messages, skip = () => false) {
+  const candidates = messages.filter((message) => message.role === "assistant" && typeof message.metadata?.another_one_run === "string" && !skip(message.metadata.another_one_run)).slice(-MAX_HISTORY);
+  const history = await storage.history(user, chat.id);
+  const sourceHistory = typeof chat.metadata.branched_from === "string" ? await storage.history(user, chat.metadata.branched_from) : [];
+  const runs = [];
+  const names = new Map;
+  for (const message of candidates) {
+    if (!message.metadata || skip(message.metadata.another_one_run))
+      continue;
+    const known = history.find((run) => run.chatId === chat.id && run.messageId === message.id && run.id === message.metadata.another_one_run);
+    if (known) {
+      runs.push(known);
+      continue;
+    }
+    const id = `message:${message.id}`;
+    const original = [...history, ...sourceHistory].find((r) => r.id === message.metadata.another_one_run);
+    const contexts = message.metadata.preset_contexts;
+    const presets = message.metadata.another_one_presets;
+    if (!Array.isArray(contexts) && !Array.isArray(presets))
+      continue;
+    const steps = (await Promise.all(message.swipes.map(async (content, index) => {
+      if (Array.isArray(contexts) && !contexts[index])
+        return null;
+      const presetId = contexts?.[index]?.preset_id ?? presets?.[index] ?? "";
+      const hash = await contentHash(content);
+      const expected = original?.steps[index];
+      const matches = original?.steps.filter((s) => s.presetId === presetId && s.contentHash === hash);
+      const swipeId = contexts?.[index]?.another_one_swipe_id;
+      const identities = original?.steps.filter((s) => s.swipeId === swipeId && s.presetId === presetId);
+      const prior = swipeId ? identities?.length === 1 ? identities[0] : undefined : original?.steps.length === message.swipes.length && expected?.presetId === presetId && (!expected.contentHash || expected.contentHash === hash) ? expected : matches?.length === 1 ? matches[0] : undefined;
+      const data = message.metadata.another_one_variables;
+      const unfinished = !prior && data?.slots.some((s) => s.presetId === presetId && !s.contentHash);
+      if (!names.has(presetId))
+        names.set(presetId, prior?.presetName ?? (await api.presets.get(presetId, user))?.name ?? "Deleted preset");
+      return {
+        presetId,
+        presetName: names.get(presetId),
+        connectionName: prior?.connectionName ?? "Copied reply",
+        status: unfinished || prior?.status === "running" || prior?.status === "waiting" ? "stopped" : prior?.status ?? "done",
+        swipe: index,
+        swipeId: contexts?.[index]?.another_one_swipe_id,
+        contentHash: hash,
+        ...prior?.error ? { error: prior.error } : {}
+      };
+    }))).filter((step) => step !== null);
+    if (!steps.length)
+      continue;
+    const outcome = steps.some((s) => s.status === "error") ? "error" : steps.some((s) => s.status === "stopped") ? "stopped" : "complete";
+    runs.push({ id, chatId: chat.id, chatName: chat.name, messageId: message.id, messageIndex: message.index_in_chat, characterName: message.name, at: original?.at ?? message.send_date * 1000, steps, outcome });
+    if (message.metadata.another_one_run !== id) {
+      const patch = { metadata_patch: { another_one_run: id } };
+      await api.chat.updateMessage(chat.id, message.id, patch);
+    }
+  }
+  if (!runs.some((run) => !history.some((existing) => existing.id === run.id && existing.chatId === run.chatId && existing.messageId === run.messageId)))
+    return false;
+  await storage.recordMany(user, runs.reverse(), async (records) => {
+    const live = new Set((await api.chat.getMessages(chat.id)).map((message) => message.id));
+    return records.filter((record) => live.has(record.messageId));
+  });
+  return true;
+}
+
 // src/backend/forks.ts
 var keyedChanges = (changes) => new Map(changes.map((change) => [`${change.scope}:${change.key}`, change]));
 var variableValue = (state, change) => Object.hasOwn(state[change.scope] ?? {}, change.key) ? state[change.scope][change.key] : null;
@@ -1181,48 +1270,7 @@ class Forks {
         nextApplied = selected ? { messageId: last.id, slot: selected.index, changes: selected.slot.changes } : undefined;
       }
     }
-    const history = await this.storage.history(user);
-    const runs = [];
-    const names = new Map;
-    for (const message of copied.filter((m) => m.metadata?.another_one_run).slice(-MAX_HISTORY)) {
-      if (!message.metadata)
-        continue;
-      const id = `fork:${message.id}`;
-      const original = history.find((r) => r.id === message.metadata.another_one_run);
-      const contexts = message.metadata.preset_contexts;
-      const presets = message.metadata.another_one_presets;
-      if (!Array.isArray(contexts) && !Array.isArray(presets))
-        continue;
-      const steps = await Promise.all(message.swipes.map(async (content, index) => {
-        const presetId = contexts?.[index]?.preset_id ?? presets?.[index] ?? "";
-        const hash = await contentHash(content);
-        const expected = original?.steps[index];
-        const matches = original?.steps.filter((s) => s.presetId === presetId && s.contentHash === hash);
-        const swipeId = contexts?.[index]?.another_one_swipe_id;
-        const identities = original?.steps.filter((s) => s.swipeId === swipeId && s.presetId === presetId);
-        const prior = swipeId ? identities?.length === 1 ? identities[0] : undefined : original?.steps.length === message.swipes.length && expected?.presetId === presetId && (!expected.contentHash || expected.contentHash === hash) ? expected : matches?.length === 1 ? matches[0] : undefined;
-        const data = message.metadata.another_one_variables;
-        const unfinished = !prior && data?.slots.some((s) => s.presetId === presetId && !s.contentHash);
-        if (!names.has(presetId))
-          names.set(presetId, prior?.presetName ?? (await this.api.presets.get(presetId, user))?.name ?? "Deleted preset");
-        return {
-          presetId,
-          presetName: names.get(presetId),
-          connectionName: prior?.connectionName ?? "Copied reply",
-          status: unfinished || prior?.status === "running" || prior?.status === "waiting" ? "stopped" : prior?.status ?? "done",
-          swipe: index,
-          swipeId: contexts?.[index]?.another_one_swipe_id,
-          contentHash: hash,
-          ...prior?.error ? { error: prior.error } : {}
-        };
-      }));
-      const outcome = steps.some((s) => s.status === "error") ? "error" : steps.some((s) => s.status === "stopped") ? "stopped" : "complete";
-      runs.push({ id, chatId, chatName: chat.name, messageId: message.id, messageIndex: message.index_in_chat, characterName: message.name, at: original?.at ?? message.send_date * 1000, steps, outcome });
-      if (message.metadata.another_one_run !== id) {
-        await this.api.chat.updateMessage(chatId, message.id, { metadata: { ...message.metadata, another_one_run: id } });
-      }
-    }
-    await this.storage.recordMany(user, runs.reverse());
+    await restoreRunHistory(this.api, this.storage, user, chat, copied);
     const latest = await this.api.chats.get(chatId, user);
     if (!latest)
       return;
@@ -1381,7 +1429,7 @@ for (const event of ["GENERATION_ENDED", "GENERATION_STOPPED"])
     if (active.get(key) === p.generationId)
       active.delete(key);
   });
-async function loadCatalog(userId) {
+async function loadCatalog(userId, chatId) {
   if (!spindle.host.capabilities["message-preset-context-v1"])
     throw new Error("CAT requires a Lumiverse build with per-swipe preset support. Update Lumiverse before enabling CAT.");
   if (!spindle.host.capabilities["chat-swipe-reasoning-v1"])
@@ -1389,7 +1437,7 @@ async function loadCatalog(userId) {
   if (!spindle.host.capabilities["chat-metadata-patch-v1"])
     throw new Error("Update Lumiverse to a build with message metadata patch support before enabling CAT.");
   const presets = await listSourcePresets(spindle.presets, userId);
-  const [settings, connections, history, activation] = await Promise.all([storage.settings(userId), spindle.connections.list(userId), storage.history(userId), storage.activation(userId)]);
+  const [settings, connections, history, activation] = await Promise.all([storage.settings(userId), spindle.connections.list(userId), chatId ? storage.history(userId, chatId) : [], storage.activation(userId)]);
   return { settings, history, activation, presets, connections: connections.map((c) => ({ id: c.id, name: c.name, model: c.model })) };
 }
 var automation = new Automation(spindle, storage, leases, loadCatalog, (chatId, userId) => inspectChat(spindle, active, chatId, userId), { capture: variableCapture, selection: variableSelection }, (user, chat) => forks.ensure(user, chat));
@@ -1413,7 +1461,7 @@ spindle.onFrontendMessage(async (raw, userId, session) => {
     let value;
     switch (msg.operation) {
       case "load":
-        value = await loadCatalog(userId);
+        value = await loadCatalog(userId, typeof input.chatId === "string" ? input.chatId : undefined);
         break;
       case "activation":
         value = await automation.setActivation(userId, input);
@@ -1441,10 +1489,14 @@ spindle.onFrontendMessage(async (raw, userId, session) => {
         if (typeof input.chatId !== "string")
           throw new Error("Open a chat first.");
         await forks.ensure(userId, input.chatId);
-        const checked = (await storage.history(userId)).filter((run) => run.chatId === input.chatId);
+        const chat = await spindle.chats.get(input.chatId, userId);
+        if (!chat)
+          throw new Error("This chat no longer exists.");
+        await restoreRunHistory(spindle, storage, userId, chat, await spindle.chat.getMessages(input.chatId), (runId) => automation.isCurrentRun(userId, runId));
+        const checked = await storage.history(userId, input.chatId);
         const messages = await restoreMessageContexts(spindle, input.chatId, checked);
         await storage.reconcileHistory(userId, checked, messages);
-        value = messages;
+        value = { messages, history: await storage.history(userId, input.chatId) };
         break;
       }
       case "disarm":
@@ -1458,8 +1510,10 @@ spindle.onFrontendMessage(async (raw, userId, session) => {
         break;
       case "selectSwipe": {
         const runId = String(input.runId);
-        const run = automation.getRun(userId, runId) || (await storage.history(userId)).find((r) => r.id === runId);
-        if (!run)
+        if (typeof input.chatId !== "string")
+          throw new Error("A chat is required.");
+        const run = automation.getRun(userId, runId) || (await storage.history(userId, input.chatId)).find((r) => r.id === runId);
+        if (!run || run.chatId !== input.chatId)
           throw new Error("This run is no longer available.");
         await selectSwipe(spindle, run, Number(input.stepIndex), () => variableSelection.sync(userId, run.chatId));
         value = true;

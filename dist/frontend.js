@@ -129,7 +129,7 @@ class Session {
     await this.driver.openChat(run.chatId);
     if (this.disposed || this.driver.chatId() !== run.chatId)
       return;
-    await this.bridge.call("selectSwipe", { runId: run.id, stepIndex });
+    await this.bridge.call("selectSwipe", { chatId: run.chatId, runId: run.id, stepIndex });
     if (this.disposed || this.driver.chatId() !== run.chatId)
       return;
     this.ctx.dom.findMessageElement(run.messageId)?.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -1886,12 +1886,15 @@ function setup(ctx) {
   }
   async function load() {
     notice.replaceChildren();
+    const chatId = ctx.state.get("chat.active").chatId;
+    const revision = contextRevision;
     try {
-      const next = await bridge.call("load", {});
+      const next = await bridge.call("load", { ...chatId ? { chatId } : {} });
       if (disposed)
         return;
       catalog = next;
-      history = next.history;
+      if (revision === contextRevision && ctx.state.get("chat.active").chatId === chatId)
+        history = next.history;
       applyActivation(next.activation);
       cat.setEnabled(next.settings.cats);
       if (opened)
@@ -1967,11 +1970,12 @@ function setup(ctx) {
     const revision = ++contextRevision;
     const { chatId } = ctx.state.get("chat.active");
     if (chatId && ctx.host.capabilities["message-preset-context-v1"])
-      bridge.call("restoreContexts", { chatId }).then((summaries) => {
+      bridge.call("restoreContexts", { chatId }).then((result) => {
         if (disposed || revision !== contextRevision || ctx.state.get("chat.active").chatId !== chatId)
           return;
-        for (const [id, summary] of Object.entries(summaries))
+        for (const [id, summary] of Object.entries(result.messages))
           messages.set(id, summary);
+        history = result.history;
         render();
       }).catch((error) => {
         if (!disposed && revision === contextRevision && ctx.state.get("chat.active").chatId === chatId)

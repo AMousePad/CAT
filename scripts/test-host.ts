@@ -198,9 +198,9 @@ try {
   const concurrentMessage = messageService.getMessage(user.id, replyId);
   messageService.updateMessage(user.id, replyId, { extra: { ...concurrentMessage.extra,
     spindle_metadata: { ...concurrentMessage.extra.spindle_metadata, other_extension: { value: "written during streaming" } } } });
-  assert.equal(await rpc("selectSwipe", { runId: liveRun.id, stepIndex: 2 }), true);
+  assert.equal(await rpc("selectSwipe", { chatId: chat.id, runId: liveRun.id, stepIndex: 2 }), true);
   assert.equal((await api(`/api/v1/chats/${chat.id}/messages?full=true`)).data.at(-1).swipe_id, 2);
-  await rpc("selectSwipe", { runId: liveRun.id, stepIndex: 0 });
+  await rpc("selectSwipe", { chatId: chat.id, runId: liveRun.id, stepIndex: 0 });
   const navigated = await api(`/api/v1/chats/${chat.id}/messages/${replyId}/swipe`, "POST", { direction: "right" });
   assert.equal(navigated.swipe_id, 1);
   pass("three provider requests overlap and all three native swipes grow before any finishes");
@@ -219,8 +219,8 @@ try {
   assert.equal(new Set(saved.extra.spindle_metadata.preset_contexts.map((context: any) => context.another_one_swipe_id)).size, 3);
   const editedText = saved.content + " Edited by an automatic tool.";
   await api(`/api/v1/chats/${chat.id}/messages/${replyId}`, "PUT", { content: editedText });
-  await rpc("selectSwipe", { runId: liveRun.id, stepIndex: 0 });
-  await rpc("selectSwipe", { runId: liveRun.id, stepIndex: 1 });
+  await rpc("selectSwipe", { chatId: chat.id, runId: liveRun.id, stepIndex: 0 });
+  await rpc("selectSwipe", { chatId: chat.id, runId: liveRun.id, stepIndex: 1 });
   assert.equal((await api(`/api/v1/chats/${chat.id}/messages?full=true`)).data.at(-1).content, editedText);
   pass("native content edits preserve CAT swipe selection and per-swipe variables");
   for (const [i, marker] of [..."ABC"].entries()) {
@@ -249,9 +249,9 @@ try {
   assert(!(await api("/api/v1/presets?limit=100")).data.some((p: any) => p.metadata?.another_one?.kind === "preparation"));
   pass("preset variables stay isolated; native arrows apply only the selected swipe's persistent state without copying presets");
   pass("sealed LumiHub and legacy Illarin blocks generate normally, exports hide their content, and source presets stay unchanged");
-  assert.equal((await rpc("load", {})).history[0].outcome, "complete");
+  assert.equal((await rpc("load", { chatId: chat.id })).history[0].outcome, "complete");
   await api(`/api/v1/chats/${chat.id}/messages/${replyId}/swipe/0`, "DELETE");
-  await rpc("selectSwipe", { runId: liveRun.id, stepIndex: 2 });
+  await rpc("selectSwipe", { chatId: chat.id, runId: liveRun.id, stepIndex: 2 });
   const afterDeletion = (await api(`/api/v1/chats/${chat.id}/messages?full=true`)).data.at(-1);
   assert.equal(afterDeletion.swipe_id, 1);
   assert.deepEqual(afterDeletion.extra.reasoningBySwipe, saved.extra.reasoningBySwipe.slice(1));
@@ -279,7 +279,7 @@ try {
   await until("one selected profile completes", () => view, v => v?.phase === "ready" && v.run?.messageId === subsetId && v.run?.outcome === "complete");
   assert.equal(requests.length, beforeSubset + 1); assert.equal(requests.at(-1).marker, "PRESET_B");
   assert.equal((await api(`/api/v1/chats/${chat.id}/messages?full=true`)).data.at(-1).swipes.length, 1);
-  await assert.rejects(rpc("selectSwipe", { runId: liveRun.id, stepIndex: 2 }), /latest reply/);
+  await assert.rejects(rpc("selectSwipe", { chatId: chat.id, runId: liveRun.id, stepIndex: 2 }), /latest reply/);
   pass("hotbar selection generates only the requested next profile; older replies cannot be selected");
   tokenDelay = 15;
   const repeatedSubsetId = await begin("SAME_PROFILES: keep my profile selection.");
@@ -337,12 +337,12 @@ try {
     assert.deepEqual(message.extra.spindle_metadata?.preset_contexts, sourceMessages[index].extra.spindle_metadata?.preset_contexts);
   }
   assert.equal((await api(`/api/v1/chats/${latestFork.id}`)).metadata.another_one_applied_variables.messageId, copied.at(-1).id);
-  const forkHistory = (await rpc("load", {})).history.filter(r => r.chatId === latestFork.id);
+  const forkHistory = (await rpc("load", { chatId: latestFork.id })).history.filter(r => r.chatId === latestFork.id);
   const lastRun = forkHistory.find(r => r.messageId === copied.at(-1).id)!;
   assert(lastRun);
-  await rpc("selectSwipe", { runId: lastRun.id, stepIndex: 1 });
-  await rpc("selectSwipe", { runId: lastRun.id, stepIndex: 0 });
-  await assert.rejects(rpc("selectSwipe", { runId: forkHistory.find(r => r.messageId === copied[2].id)!.id, stepIndex: 0 }), /latest reply/);
+  await rpc("selectSwipe", { chatId: latestFork.id, runId: lastRun.id, stepIndex: 1 });
+  await rpc("selectSwipe", { chatId: latestFork.id, runId: lastRun.id, stepIndex: 0 });
+  await assert.rejects(rpc("selectSwipe", { chatId: latestFork.id, runId: forkHistory.find(r => r.messageId === copied[2].id)!.id, stepIndex: 0 }), /latest reply/);
   pass("latest forks copy every swipe and captured context, remap variable ownership and expose selectable fork-local results");
   const forkReply = copied.at(-1);
   assert.deepEqual(forkReply.extra.reasoningBySwipe, sourceMessages.at(-1).extra.reasoningBySwipe);
@@ -405,9 +405,9 @@ try {
   const stoppedSource = (await api(`/api/v1/chats/${olderFork.id}/messages?full=true`)).data.at(-1);
   assert.equal(stoppedSource.id, partial.id); assert(stoppedSource.swipes.every((s: string) => !s.includes("word30")));
   assert.deepEqual((await api(`/api/v1/chats/${liveFork.id}/messages?full=true`)).data.at(-1).swipes, frozen);
-  const liveForkRun = (await rpc("load", {})).history.find(r => r.chatId === liveFork.id)!;
+  const liveForkRun = (await rpc("load", { chatId: liveFork.id })).history.find(r => r.chatId === liveFork.id)!;
   assert.equal(liveForkRun.outcome, "stopped");
-  await rpc("selectSwipe", { runId: liveForkRun.id, stepIndex: 2 });
+  await rpc("selectSwipe", { chatId: liveFork.id, runId: liveForkRun.id, stepIndex: 2 });
   pass("forking mid-stream stops original requests, preserves the copied partial replies, and keeps the fork enabled");
   await rpc("disarm", { stop: true });
   await rpc("save", { settings: { ...catalog.settings, slots: [
@@ -449,13 +449,28 @@ try {
   assert.deepEqual((await rpc("load", {})).activation, disabled);
   assert.deepEqual(disabled.slotIds, ["repeat-alt"]);
   pass("another browser uses the saved account preference, and an explicit Disable also survives worker restart");
+  const exported = await api(`/api/v1/chats/${repeatFork.id}/export`);
+  const importedRuns: string[] = [];
+  for (let copy = 0; copy < 2; copy++) {
+    const imported = await api("/api/v1/chats/import", "POST", { ...exported, character_id: character.id });
+    const metadataBefore = (await api(`/api/v1/chats/${imported.chat_id}`)).metadata;
+    await rpc("restoreContexts", { chatId: imported.chat_id });
+    const restored = (await rpc("load", { chatId: imported.chat_id })).history.filter(run => run.chatId === imported.chat_id);
+    assert(restored.length > 0);
+    const importedMessages = (await api(`/api/v1/chats/${imported.chat_id}/messages?full=true`)).data;
+    assert(restored.every(run => importedMessages.some((message: any) => message.id === run.messageId && message.extra.spindle_metadata.another_one_run === run.id)));
+    assert.deepEqual((await api(`/api/v1/chats/${imported.chat_id}`)).metadata, metadataBefore);
+    importedRuns.push(...restored.map(run => run.id));
+  }
+  assert.equal(new Set(importedRuns).size, importedRuns.length);
+  pass("native export and repeated import restore independent message-linked history without rewinding variables");
   const beforeDeletion = (await api(`/api/v1/chats/${repeatFork.id}/messages?full=true`)).data;
   const lastReply = beforeDeletion.find((m: any) => m.id === browserId);
   const summaries = await rpc("restoreContexts", { chatId: repeatFork.id });
-  assert.deepEqual(summaries[browserId], { index: lastReply.index_in_chat, name: lastReply.name });
-  assert.equal((await rpc("load", {})).history.find(r => r.messageId === browserId)!.characterName, lastReply.name);
+  assert.deepEqual(summaries.messages[browserId], { index: lastReply.index_in_chat, name: lastReply.name });
+  assert.equal((await rpc("load", { chatId: repeatFork.id })).history.find(r => r.messageId === browserId)!.characterName, lastReply.name);
   await api(`/api/v1/chats/${repeatFork.id}/messages/${browserId}`, "DELETE");
-  await until("deleted reply history removed", () => rpc("load", {}), value => !value.history.some(r => r.messageId === browserId));
+  await until("deleted reply history removed", () => rpc("load", { chatId: repeatFork.id }), value => !value.history.some(r => r.messageId === browserId));
   assert.equal((await api(`/api/v1/chats/${repeatFork.id}/messages?full=true`)).data.length, beforeDeletion.length - 1);
   pass("message deletion removes its saved swipe entry, and existing headers use native message numbers and character names");
 
@@ -466,7 +481,7 @@ try {
     m => m.id === deletedDuringStream && m.swipes.some((s: string) => s.includes("word1")));
   await api(`/api/v1/chats/${repeatFork.id}/messages/${deletedDuringStream}`, "DELETE");
   await until("deleted stream settled", () => view, v => v?.phase === "off" && v.run === null);
-  assert(!(await rpc("load", {})).history.some(r => r.messageId === deletedDuringStream));
+  assert(!(await rpc("load", { chatId: repeatFork.id })).history.some(r => r.messageId === deletedDuringStream));
   assert(!(await api(`/api/v1/chats/${repeatFork.id}/messages?full=true`)).data.some((m: any) => m.id === deletedDuringStream));
   pass("deleting a streaming reply stops its requests without recreating the message or its swipe history");
   await rpc("arm", { chatId: repeatFork.id, connectionId: connection.id });

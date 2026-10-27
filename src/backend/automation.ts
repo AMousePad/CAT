@@ -125,8 +125,12 @@ export class Automation {
     if (!owner.current && this.owners.get(owner.user) === owner) this.owners.delete(owner.user);
   }
   getRun(user: string, runId: string) {
-    const run = this.owners.get(user)?.view.run;
+    const owner = this.owners.get(user);
+    const run = owner?.current?.record ?? owner?.view.run;
     return run?.id === runId ? structuredClone(run) : undefined;
+  }
+  isCurrentRun(user: string, runId: string) {
+    return this.owners.get(user)?.current?.record.id === runId;
   }
   preparePreset(user: string, session: string, runId: string, index: number) {
     const owner = this.owned(user, session);
@@ -202,7 +206,7 @@ export class Automation {
       await this.prepareChat?.(user, chatId);
       const inspection = await this.inspect(chatId, user);
       if (inspection.blockedReason || inspection.busy) throw new Error(inspection.blockedReason || "Wait for this chat's generation to finish.");
-      const history = await this.storage.history(user);
+      const history = await this.storage.history(user, chatId);
       if (!owner.armed || owner.navigation !== navigation || this.owners.get(user) !== owner || !this.leases.valid(user, session)) return null;
       owner.chatId = chatId;
       owner.view = { phase: "ready", detail: "Enabled. Send a message to generate swipes.",

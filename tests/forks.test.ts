@@ -34,6 +34,7 @@ async function fixture(forkAt = 0) {
     chats: { get: async (id: string) => structuredClone(chats.get(id) ?? null), update: async (id: string, patch: any) => { writes++; Object.assign(chats.get(id), structuredClone(patch)); } },
     chat: { getMessages: async (id: string) => structuredClone(messages.get(id)), updateMessage: async (chatId: string, id: string, patch: any) => {
       writes++; const m = messages.get(chatId)!.find(m => m.id === id); Object.assign(m, structuredClone(patch));
+      if (patch.metadata_patch) Object.assign(m.metadata, structuredClone(patch.metadata_patch));
       if (patch.swipe_id !== undefined) m.content = m.swipes[m.swipe_id];
     } },
   } as unknown as SpindleAPI;
@@ -57,7 +58,7 @@ test("older forks rewind all later extension deltas, including introduced variab
   expect(chat.metadata.another_one_applied_variables.messageId).toBe("copy-a");
   expect(f.chats.get("source")).toEqual(source); expect(f.messages.get("source")).toEqual(sourceMessages);
   const run = f.history.find(r => r.chatId === "fork")!;
-  expect(run.id).toBe("fork:copy-a"); expect(run.steps[0].connectionName).toBe("Connection");
+  expect(run.id).toBe("message:copy-a"); expect(run.steps[0].connectionName).toBe("Connection");
   expect(run.messageIndex).toBe(0);
   await selectSwipe(f.api, run, 1, () => f.variables.sync("u", "fork"));
   expect(f.chats.get("fork").metadata.chat_variables.counter).toBe("10");

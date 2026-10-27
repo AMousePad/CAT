@@ -8,7 +8,21 @@ export class Storage {
     await this.locks.get(userId);
     return normalizeSettings(await this.read("settings.json", userId, null));
   }
-  history(userId: string): Promise<RunRecord[]> { return this.read("history.json", userId, []); }
+  private historyPath(chatId: string) {
+    if (!/^[a-zA-Z0-9_-]{1,100}$/.test(chatId)) throw new Error("Invalid chat ID.");
+    return `history/${chatId}.json`;
+  }
+  private async readHistory(userId: string, chatId: string): Promise<RunRecord[]> {
+    const path = this.historyPath(chatId);
+    if (await this.api.exists(path, userId)) return this.read(path, userId, []);
+    const legacy = await this.read<RunRecord[]>("history.json", userId, []);
+    const history = legacy.filter(run => run.chatId === chatId).slice(0, MAX_HISTORY);
+    await this.api.setJson(path, history, { userId, indent: 2 });
+    return history;
+  }
+  history(userId: string, chatId: string): Promise<RunRecord[]> {
+    return this.write(userId, () => this.readHistory(userId, chatId));
+  }
   async activation(userId: string): Promise<Activation> {
     await this.locks.get(userId);
     return this.read("activation.json", userId, { enabled: false, revision: 0 });
@@ -47,35 +61,39 @@ export class Storage {
   }
   removeMessage(userId: string, chatId: string, messageId: string): Promise<boolean> {
     return this.write(userId, async () => {
-      const history = await this.history(userId);
+      const history = await this.readHistory(userId, chatId);
       const next = history.filter(run => run.chatId !== chatId || run.messageId !== messageId);
       if (next.length === history.length) return false;
-      await this.api.setJson("history.json", next, { userId, indent: 2 });
+      await this.api.setJson(this.historyPath(chatId), next, { userId, indent: 2 });
       return true;
     });
   }
   reconcileHistory(userId: string, checked: readonly RunRecord[], messages: Record<string, MessageSummary | null>): Promise<void> {
-    const byId = new Map(checked.map(run => [run.id, run.messageId]));
     return this.write(userId, async () => {
-      const history = await this.history(userId);
-      // Only reconcile the entries read before fetching messages. A new run may
-      // have finished while that request was in flight.
-      const next = history.flatMap(run => {
-        if (!byId.has(run.id) || byId.get(run.id) !== run.messageId) return [run];
-        const message = messages[run.messageId];
-        return message ? [{ ...run, messageIndex: message.index, characterName: message.name }] : [];
-      });
-      if (JSON.stringify(next) !== JSON.stringify(history)) await this.api.setJson("history.json", next, { userId, indent: 2 });
+      for (const chatId of new Set(checked.map(run => run.chatId))) {
+        const byId = new Map(checked.filter(run => run.chatId === chatId).map(run => [run.id, run.messageId]));
+        const history = await this.readHistory(userId, chatId);
+        const next = history.flatMap(run => {
+          if (!byId.has(run.id) || byId.get(run.id) !== run.messageId) return [run];
+          const message = messages[run.messageId];
+          return message ? [{ ...run, messageIndex: message.index, characterName: message.name }] : [];
+        });
+        if (JSON.stringify(next) !== JSON.stringify(history)) await this.api.setJson(this.historyPath(chatId), next, { userId, indent: 2 });
+      }
     });
   }
-  recordMany(userId: string, runs: RunRecord[]): Promise<void> {
+  recordMany(userId: string, runs: RunRecord[], validate?: (runs: RunRecord[]) => Promise<RunRecord[]>): Promise<void> {
     if (runs.some(run => !run.messageId)) return Promise.reject(new Error("A swipe entry must belong to a message."));
     if (!runs.length) return Promise.resolve();
     return this.write(userId, async () => {
-      const history = await this.history(userId);
-      const ids = new Set(runs.map(r => r.id));
-      const next = [...runs, ...history.filter(r => !ids.has(r.id))].slice(0, MAX_HISTORY);
-      await this.api.setJson("history.json", next, { userId, indent: 2 });
+      if (validate) runs = await validate(runs);
+      for (const chatId of new Set(runs.map(run => run.chatId))) {
+        const incoming = runs.filter(run => run.chatId === chatId);
+        const history = await this.readHistory(userId, chatId);
+        const messages = new Set(incoming.map(run => run.messageId));
+        const next = [...incoming, ...history.filter(run => !messages.has(run.messageId))].slice(0, MAX_HISTORY);
+        await this.api.setJson(this.historyPath(chatId), next, { userId, indent: 2 });
+      }
     });
   }
 }

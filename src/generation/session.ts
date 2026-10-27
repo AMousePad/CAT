@@ -69,7 +69,7 @@ export class Session {
     if (this.enabled && this.driver.chatId() !== run.chatId) await this.disable("Chat changed.", true);
     await this.driver.openChat(run.chatId);
     if (this.disposed || this.driver.chatId() !== run.chatId) return;
-    await this.bridge.call("selectSwipe", { runId: run.id, stepIndex });
+    await this.bridge.call("selectSwipe", { chatId: run.chatId, runId: run.id, stepIndex });
     if (this.disposed || this.driver.chatId() !== run.chatId) return;
     this.ctx.dom.findMessageElement(run.messageId)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }
