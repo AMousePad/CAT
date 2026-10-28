@@ -514,7 +514,9 @@ try {
   }
   const count = async () => (await api(`/api/v1/chats/${variablesChat.id}`)).metadata.chat_variables.ao_probe_counter;
   assert.equal(await count(), "3");
-  await api(`/api/v1/chats/${variablesChat.id}/messages/bulk-delete`, "POST", { message_ids: variableReplies.slice(1) });
+  const variableMessages = (await api(`/api/v1/chats/${variablesChat.id}/messages?full=true`)).data;
+  const firstVariableReply = variableMessages.findIndex((message: any) => message.id === variableReplies[0]);
+  await api(`/api/v1/chats/${variablesChat.id}/messages/bulk-delete`, "POST", { message_ids: variableMessages.slice(firstVariableReply + 1).map((message: any) => message.id) });
   assert.equal(await count(), "1");
   await api(`/api/v1/chats/${variablesChat.id}/messages/${variableReplies[0]}/swipe`, "POST", { direction: "right" });
   assert.equal(await count(), "10");
@@ -522,12 +524,29 @@ try {
   assert.equal(await count(), "1");
   pass("bulk deletion restores the surviving reply's variables before observers run and its alternate still selects correctly");
   await rpc("disarm", { stop: true });
+  const nativeChat = await api("/api/v1/chats", "POST", { character_id: character.id, name: "Native variable verification" });
+  await api(`/api/v1/chats/${nativeChat.id}/messages`, "POST", { is_user: true, name: "User", content: "Native reply." });
+  assert.equal((await api(`/api/v1/chats/${nativeChat.id}`)).metadata._swipe_variable_state, undefined);
+  let nativeReplyId: string | undefined;
+  for (const mode of ["normal", "regenerate"] as const) {
+    const eventStart = generationEvents.length;
+    await api(`/api/v1/generate${mode === "regenerate" ? "/regenerate" : ""}`, "POST", {
+      chat_id: nativeChat.id, ...(nativeReplyId ? { message_id: nativeReplyId } : {}), connection_id: connection.id,
+      preset_id: presets[0].id, force_preset_id: true,
+    });
+    const completed = await until("native default variables", () => generationEvents.slice(eventStart).find(event => event.event === "GENERATION_ENDED" && event.payload.chatId === nativeChat.id), Boolean);
+    nativeReplyId = completed!.payload.messageId;
+    const reply = (await api(`/api/v1/chats/${nativeChat.id}/messages?full=true`)).data.find((message: any) => message.id === nativeReplyId);
+    assert.equal((await api(`/api/v1/chats/${nativeChat.id}`)).metadata.chat_variables.ao_probe_counter, "1");
+    assert.equal(reply.extra.variableStateBySwipe[reply.swipe_id].before.values.chat.ao_probe_counter, undefined);
+  }
+  pass("native generation tracks variables without extension setup and regeneration uses the original starting state");
   const nativeEventStart = generationEvents.length;
   await api("/api/v1/generate/regenerate", "POST", { chat_id: variablesChat.id, message_id: variableReplies[0], connection_id: connection.id,
     preset_id: presets[0].id, force_preset_id: true });
   await until("native variable generation finished", () => generationEvents.slice(nativeEventStart), events => events.some(e => e.event === "GENERATION_ENDED" && e.payload.chatId === variablesChat.id));
-  assert.equal(await count(), "2");
-  for (const [direction, expected] of [["left", "10"], ["left", "1"], ["right", "10"], ["right", "2"]]) {
+  assert.equal(await count(), "1");
+  for (const [direction, expected] of [["left", "10"], ["left", "1"], ["right", "10"], ["right", "1"]]) {
     await api(`/api/v1/chats/${variablesChat.id}/messages/${variableReplies[0]}/swipe`, "POST", { direction });
     assert.equal(await count(), expected);
   }
