@@ -190,9 +190,6 @@ class Leases {
   }
 }
 
-// src/generation/managed.ts
-var managedGenerate = (api) => api.generate;
-
 // src/generation/preset-context.ts
 var PRESET_CHANGE_NOTE = "Note: Your instructions have changed, ensure you only generate prose-adjacent items that are **currently** specified. Do not generate structures based on past messages.";
 function usesMultiplePresets(messages, presetIds) {
@@ -420,11 +417,16 @@ class Automation {
       if (!user)
         return;
       const { frontendSessionId } = raw;
-      if (this.arming.get(user)?.session === frontendSessionId)
-        this.arming.delete(user);
+      const attempt = this.arming.get(user);
+      if (attempt?.session === frontendSessionId) {
+        if (attempt.background)
+          attempt.detached = true;
+        else
+          this.arming.delete(user);
+      }
       const owner = this.owners.get(user);
-      if (owner?.session === frontendSessionId && owner.armed)
-        this.disarm(user, frontendSessionId, true, "Browser disconnected. Partial replies saved.");
+      if (owner?.session === frontendSessionId)
+        this.detach(owner);
     });
     api.on("GENERATION_STOPPED", (p, user) => {
       if (user)
@@ -496,10 +498,8 @@ class Automation {
       if (!owner.parent || owner.current || owner.preparation)
         return raw;
       const parent = owner.parent;
-      if (!this.leases.heartbeat(owner.user, owner.session)) {
-        await this.fail(owner, "The browser connection expired. Enable again.");
-        return raw;
-      }
+      if (!owner.detached)
+        this.leases.claim(owner.user, owner.session);
       await this.variables?.selection.sync(owner.user, owner.chatId);
       const messages = await api.chat.getMessages(owner.chatId);
       if (signal?.aborted || !owner.armed || this.owners.get(owner.user) !== owner || owner.parent !== parent || owner.current || owner.preparation)
@@ -527,13 +527,45 @@ class Automation {
     setInterval(() => {
       for (const owner of this.owners.values())
         if ((owner.armed || owner.current) && !this.leases.valid(owner.user, owner.session)) {
-          this.fail(owner, "The controlling browser disconnected. Partial replies have been kept.");
+          this.detach(owner);
         }
     }, 15000).unref?.();
   }
   emit(owner, phase, detail) {
     owner.view = { ...owner.view, phase, detail };
-    this.api.sendToFrontend({ type: "view", view: owner.view, armed: owner.armed }, owner.user, { frontendSessionId: owner.session });
+    if (owner.detached)
+      return;
+    this.api.sendToFrontend({ type: "view", chatId: owner.chatId, view: owner.view, armed: owner.armed }, owner.user, { frontendSessionId: owner.session });
+  }
+  detach(owner) {
+    owner.detached = true;
+    this.leases.release(owner.user, owner.session);
+    if (!owner.parent && !owner.preparation && !owner.current) {
+      owner.armed = false;
+      this.release(owner, owner.view.phase === "error");
+    }
+  }
+  resume(user, session, chatId) {
+    const attempt = this.arming.get(user);
+    if (attempt?.background && attempt.chatId === chatId && (attempt.detached || attempt.session === session)) {
+      attempt.session = session;
+      attempt.detached = false;
+    }
+    const owner = this.owners.get(user);
+    if (!owner || owner.chatId !== chatId || owner.session !== session && !owner.detached && this.leases.valid(user, owner.session))
+      return;
+    this.leases.release(user, owner.session);
+    owner.session = session;
+    owner.detached = false;
+    this.leases.claim(user, session);
+    this.emit(owner, owner.view.phase, owner.view.detail);
+  }
+  heartbeat(user, session) {
+    const owner = this.owners.get(user);
+    if (!owner || owner.session !== session)
+      return false;
+    this.resume(user, session, owner.chatId);
+    return true;
   }
   owned(user, session) {
     const owner = this.owners.get(user);
@@ -541,9 +573,9 @@ class Automation {
       throw new Error("Enable CAT in this browser first.");
     return owner;
   }
-  release(owner) {
+  release(owner, preserveView = false) {
     this.leases.release(owner.user, owner.session);
-    if (!owner.current && this.owners.get(owner.user) === owner)
+    if (!preserveView && !owner.current && this.owners.get(owner.user) === owner)
       this.owners.delete(owner.user);
   }
   getRun(user, runId) {
@@ -567,7 +599,7 @@ class Automation {
         throw new Error("These swipes were cancelled.");
       }
       const slot = owner.slots[index];
-      const result = await managedGenerate(this.api).dryRun({
+      const result = await this.api.generate.dryRun({
         chatId: owner.chatId,
         connectionId: slot.connectionId,
         presetId: value.presetId,
@@ -600,7 +632,7 @@ class Automation {
       throw new Error("Wait for the swipes to finish or press Stop.");
     if (this.arming.has(user))
       throw new Error("CAT is already enabling. Wait for it to finish.");
-    const attempt = { session };
+    const attempt = { session, chatId, background: !!nativeGenerationId, detached: false };
     this.arming.set(user, attempt);
     try {
       await this.prepareChat?.(user, chatId);
@@ -629,17 +661,18 @@ class Automation {
       const latest = this.owners.get(user);
       if (latest?.current || latest?.preparation)
         throw new Error("Swipes are already generating. Press Stop first.");
-      if (!this.leases.claim(user, session))
+      if (!this.leases.claim(user, attempt.session))
         throw new Error("Another browser controls CAT. Disable it there first.");
       const owner = {
         user,
-        session,
+        session: attempt.session,
         chatId,
         armed: true,
         slots,
         configured: slots,
         nextIds,
         catalog,
+        detached: attempt.detached,
         view: { phase: "ready", detail: "Enabled. Send a message to generate swipes.", run: null }
       };
       this.owners.set(user, owner);
@@ -744,9 +777,29 @@ class Automation {
       owner.deadline = setTimeout(() => {
         this.fail(owner, "Prompt preparation did not finish. Enable again to retry.");
       }, 120000);
-      this.api.sendToFrontend(owner.preparation, user, { frontendSessionId: owner.session });
+      await this.prepare(owner, owner.preparation);
     } else
       await this.disarm(user, owner.session, true, "Stopped before generating swipes.");
+  }
+  async prepare(owner, preparation) {
+    let messageId;
+    try {
+      const prompts = await Promise.all(preparation.slots.map(async (_, index) => (await this.preparePreset(owner.user, owner.session, preparation.runId, index)).prompt));
+      if (owner.preparation !== preparation)
+        return;
+      messageId = (await this.api.chat.appendMessage(preparation.chatId, {
+        role: "assistant",
+        content: "",
+        name: preparation.name,
+        characterId: preparation.characterId,
+        metadata: { another_one_run: preparation.runId }
+      })).id;
+      if (owner.preparation !== preparation)
+        throw new Error("Stopped before generating swipes.");
+      await this.launch(owner.user, owner.session, preparation.runId, messageId, prompts);
+    } catch (error) {
+      await this.preparationFailed(owner.user, owner.session, preparation.runId, errorText(error), preparation.chatId, messageId);
+    }
   }
   async launch(user, session, runId, messageId, prompts) {
     const owner = this.owned(user, session);
@@ -771,7 +824,7 @@ class Automation {
       if (inspection.blockedReason || inspection.busy)
         throw new Error(inspection.blockedReason || "Another generation started before streaming could begin.");
       chatName = inspection.chatName;
-      if (!owner.armed || owner.preparation?.runId !== runId || !this.leases.valid(user, session))
+      if (!owner.armed || owner.preparation?.runId !== runId)
         throw new Error("Cancelled before generating swipes.");
       if (this.variables) {
         variableState = { version: 1, slots: await Promise.all(prompts.map(async (prompt, index) => {
@@ -783,7 +836,7 @@ class Automation {
         if (JSON.stringify(variableState).length > 2000000)
           throw new Error("The combined variable state is too large to save.");
       }
-      if (!owner.armed || owner.preparation?.runId !== runId || !this.leases.valid(user, session))
+      if (!owner.armed || owner.preparation?.runId !== runId)
         throw new Error("Cancelled before generating swipes.");
     } finally {
       owner.launching = undefined;
@@ -851,25 +904,24 @@ class Automation {
         if (firstWrite) {
           if (prompts.some((prompt) => !prompt.responseContextId))
             throw new Error("The prepared response context is missing.");
-          const session = await managedGenerate(this.api).beginMessage({
+          const session = await this.api.generate.beginMessage({
             chatId: owner.chatId,
             messageId,
             responseContextIds: prompts.map((prompt) => prompt.responseContextId),
-            userId: user,
-            frontendSessionId: owner.session
+            userId: user
           });
           owner.managedId = session.id;
           run.abort.signal.addEventListener("abort", () => {
-            managedGenerate(this.api).abortMessage(session.id).catch(() => {});
+            this.api.generate.abortMessage(session.id).catch(() => {});
           }, { once: true });
           if (run.abort.signal.aborted)
-            await managedGenerate(this.api).abortMessage(session.id);
+            await this.api.generate.abortMessage(session.id);
         }
         firstWrite = false;
       },
       finalize: async () => {
         if (owner.managedId) {
-          const result = await managedGenerate(this.api).finishMessage(owner.managedId);
+          const result = await this.api.generate.finishMessage(owner.managedId);
           if (!result.completed)
             run.stop();
         }
@@ -899,6 +951,8 @@ class Automation {
         await this.storage.record(user, record);
       owner.current = undefined;
       owner.managedId = undefined;
+      if (owner.detached)
+        owner.armed = false;
       if (owner.switching)
         return;
       if (record.outcome === "complete" && owner.armed)
@@ -921,8 +975,9 @@ class Automation {
     owner.preparation = undefined;
     owner.takingOver = undefined;
     owner.parent = undefined;
+    owner.prepared = undefined;
     owner.current?.stop(detail);
-    this.release(owner);
+    this.release(owner, owner.detached === true);
     this.emit(owner, "error", detail);
     if (runId)
       await this.cancelPreparation(owner, runId);
@@ -1548,6 +1603,8 @@ for (const event of ["GENERATION_ENDED", "GENERATION_STOPPED"])
       active.delete(key);
   });
 async function loadCatalog(userId, chatId) {
+  if (!spindle.host.capabilities["chat-append-identity-v1"])
+    throw new Error("Update Lumiverse to a build with background CAT generation support before enabling CAT.");
   if (!spindle.host.capabilities["generation-message-sessions-v1"])
     throw new Error("Update Lumiverse to a build with managed message generation before enabling CAT.");
   if (!spindle.host.capabilities["message-preset-context-v1"])
@@ -1588,18 +1645,16 @@ spindle.onFrontendMessage(async (raw, userId, session) => {
     switch (msg.operation) {
       case "load":
         value = await loadCatalog(userId, typeof input.chatId === "string" ? input.chatId : undefined);
+        automation.resume(userId, session, typeof input.chatId === "string" ? input.chatId : undefined);
         break;
       case "activation":
         value = await automation.setActivation(userId, input);
-        break;
-      case "preparePreset":
-        value = await automation.preparePreset(userId, session, String(input.runId), Number(input.stepIndex));
         break;
       case "save":
         value = await storage.save(userId, input.settings);
         break;
       case "heartbeat":
-        value = leases.heartbeat(userId, session);
+        value = automation.heartbeat(userId, session);
         break;
       case "arm":
         if (typeof input.chatId !== "string" || typeof input.connectionId !== "string")
@@ -1622,17 +1677,12 @@ spindle.onFrontendMessage(async (raw, userId, session) => {
         const checked = await storage.history(userId, input.chatId);
         const messages = await restoreMessageContexts(spindle, input.chatId, checked);
         await storage.reconcileHistory(userId, checked, messages);
+        automation.resume(userId, session, input.chatId);
         value = { messages, history: await storage.history(userId, input.chatId) };
         break;
       }
       case "disarm":
         value = await automation.disarm(userId, session, input.stop === true);
-        break;
-      case "launch":
-        value = await automation.launch(userId, session, String(input.runId), String(input.messageId), input.prompts);
-        break;
-      case "preparationFailed":
-        value = await automation.preparationFailed(userId, session, String(input.runId), String(input.error), String(input.chatId), typeof input.messageId === "string" ? input.messageId : undefined);
         break;
       case "selectSwipe": {
         const runId = String(input.runId);

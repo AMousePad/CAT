@@ -2,6 +2,8 @@
 
 Otherwise known as CAT, this extension lets you generate several swipes at once, using a seperate preset/model for each swipe. Swipes render their regexes based on the preset that generated it, allowing you to mix and match presets without breaking other messages. Responses stream into each swipe, and they are all navigatable during streaming.
 
+Once a send reaches Lumiverse, CAT prepares and generates its swipes on the server. You can leave or close the browser tab and return to the saved replies. Lumiverse must stay running; pressing Stop still cancels generation.
+
 ![1793076455928](image/README/1793076455928.png)
 
 I made this for 3 reasons:

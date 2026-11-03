@@ -1,4 +1,3 @@
-import { managedGenerate } from "../generation/managed";
 import type { ChatMessageDTO, SpindleAPI } from "lumiverse-spindle-types";
 import { ParallelRun, type PreparedPrompt } from "../generation/parallel-run";
 import { errorText, validateSlots, type ActivationPatch, type Catalog, type Inspection, type ViewState } from "../shared";
@@ -18,12 +17,13 @@ interface Owner {
   preparation?: Preparation; current?: ParallelRun; deadline?: ReturnType<typeof setTimeout>; launching?: string;
   prepared?: Map<number, Promise<{ token: string; presetId: string; prompt: PreparedPrompt }>>;
   managedId?: string;
+  detached?: boolean;
   switching?: boolean; completion?: Promise<void>; navigation?: number;
 }
 
 export class Automation {
   private owners = new Map<string, Owner>();
-  private arming = new Map<string, { session: string }>();
+  private arming = new Map<string, { session: string; chatId: string; background: boolean; detached: boolean }>();
   private active = new Map<string, Parent>();
   constructor(private api: SpindleAPI, private storage: Storage, private leases: Leases,
     private catalog: (user: string) => Promise<Catalog>, private inspect: (chat: string, user: string) => Promise<Inspection>,
@@ -33,10 +33,13 @@ export class Automation {
     api.on("FRONTEND_SESSION_CLOSED", (raw, user) => {
       if (!user) return;
       const { frontendSessionId } = raw as { frontendSessionId: string };
-      if (this.arming.get(user)?.session === frontendSessionId) this.arming.delete(user);
+      const attempt = this.arming.get(user);
+      if (attempt?.session === frontendSessionId) {
+        if (attempt.background) attempt.detached = true;
+        else this.arming.delete(user);
+      }
       const owner = this.owners.get(user);
-      if (owner?.session === frontendSessionId && owner.armed)
-        void this.disarm(user, frontendSessionId, true, "Browser disconnected. Partial replies saved.");
+      if (owner?.session === frontendSessionId) this.detach(owner);
     });
     api.on("GENERATION_STOPPED", (p, user) => { if (user) void this.stopped(p, user); });
     api.on("GENERATION_ENDED", (p, user) => {
@@ -91,7 +94,7 @@ export class Automation {
       if (owner.switching) throw new Error("CAT is opening the fork. Wait for it to finish before sending.");
       if (!owner.parent || owner.current || owner.preparation) return raw;
       const parent = owner.parent;
-      if (!this.leases.heartbeat(owner.user, owner.session)) { await this.fail(owner, "The browser connection expired. Enable again."); return raw; }
+      if (!owner.detached) this.leases.claim(owner.user, owner.session);
       await this.variables?.selection.sync(owner.user, owner.chatId);
       const messages = await api.chat.getMessages(owner.chatId);
       if (signal?.aborted || !owner.armed || this.owners.get(owner.user) !== owner || owner.parent !== parent || owner.current || owner.preparation) return raw;
@@ -109,22 +112,47 @@ export class Automation {
     }, 1, { required: true });
     setInterval(() => {
       for (const owner of this.owners.values()) if ((owner.armed || owner.current) && !this.leases.valid(owner.user, owner.session)) {
-        void this.fail(owner, "The controlling browser disconnected. Partial replies have been kept.");
+        this.detach(owner);
       }
     }, 15_000).unref?.();
   }
   private emit(owner: Owner, phase: ViewState["phase"], detail: string) {
     owner.view = { ...owner.view, phase, detail };
-    this.api.sendToFrontend({ type: "view", view: owner.view, armed: owner.armed }, owner.user, { frontendSessionId: owner.session });
+    if (owner.detached) return;
+    this.api.sendToFrontend({ type: "view", chatId: owner.chatId, view: owner.view, armed: owner.armed }, owner.user, { frontendSessionId: owner.session });
+  }
+  private detach(owner: Owner) {
+    owner.detached = true;
+    this.leases.release(owner.user, owner.session);
+    if (!owner.parent && !owner.preparation && !owner.current) {
+      owner.armed = false; this.release(owner, owner.view.phase === "error");
+    }
+  }
+  resume(user: string, session: string, chatId?: string) {
+    const attempt = this.arming.get(user);
+    if (attempt?.background && attempt.chatId === chatId && (attempt.detached || attempt.session === session)) {
+      attempt.session = session; attempt.detached = false;
+    }
+    const owner = this.owners.get(user);
+    if (!owner || owner.chatId !== chatId || (owner.session !== session && !owner.detached && this.leases.valid(user, owner.session))) return;
+    this.leases.release(user, owner.session);
+    owner.session = session; owner.detached = false; this.leases.claim(user, session);
+    this.emit(owner, owner.view.phase, owner.view.detail);
+  }
+  heartbeat(user: string, session: string) {
+    const owner = this.owners.get(user);
+    if (!owner || owner.session !== session) return false;
+    this.resume(user, session, owner.chatId);
+    return true;
   }
   private owned(user: string, session: string): Owner {
     const owner = this.owners.get(user);
     if (!owner || owner.session !== session) throw new Error("Enable CAT in this browser first.");
     return owner;
   }
-  private release(owner: Owner) {
+  private release(owner: Owner, preserveView = false) {
     this.leases.release(owner.user, owner.session);
-    if (!owner.current && this.owners.get(owner.user) === owner) this.owners.delete(owner.user);
+    if (!preserveView && !owner.current && this.owners.get(owner.user) === owner) this.owners.delete(owner.user);
   }
   getRun(user: string, runId: string) {
     const owner = this.owners.get(user);
@@ -144,7 +172,7 @@ export class Automation {
         await this.variables!.capture.cancel(user, runId); throw new Error("These swipes were cancelled.");
       }
       const slot = owner.slots[index];
-      const result = await managedGenerate(this.api).dryRun({ chatId: owner.chatId, connectionId: slot.connectionId,
+      const result = await this.api.generate.dryRun({ chatId: owner.chatId, connectionId: slot.connectionId,
         presetId: value.presetId, forcePresetId: true, includeRequestMessages: true, retainResponseContext: true,
         personaId: owner.preparation?.personaId, generationType: "normal" }, user);
       if (!result.responseContextId || !Array.isArray(result.request_messages)) throw new Error("Update Lumiverse to a build with managed message generation before using CAT.");
@@ -158,7 +186,7 @@ export class Automation {
     const previous = this.owners.get(user);
     if (previous?.current || previous?.preparation) throw new Error("Wait for the swipes to finish or press Stop.");
     if (this.arming.has(user)) throw new Error("CAT is already enabling. Wait for it to finish.");
-    const attempt = { session };
+    const attempt = { session, chatId, background: !!nativeGenerationId, detached: false };
     this.arming.set(user, attempt);
     try {
       await this.prepareChat?.(user, chatId);
@@ -176,8 +204,8 @@ export class Automation {
       if (slots.some(s => !catalog.connections.some(c => c.id === s.connectionId))) throw new Error("Select an active connection or choose one for each swipe.");
       const latest = this.owners.get(user);
       if (latest?.current || latest?.preparation) throw new Error("Swipes are already generating. Press Stop first.");
-      if (!this.leases.claim(user, session)) throw new Error("Another browser controls CAT. Disable it there first.");
-      const owner: Owner = { user, session, chatId, armed: true, slots, configured: slots, nextIds, catalog,
+      if (!this.leases.claim(user, attempt.session)) throw new Error("Another browser controls CAT. Disable it there first.");
+      const owner: Owner = { user, session: attempt.session, chatId, armed: true, slots, configured: slots, nextIds, catalog, detached: attempt.detached,
         view: { phase: "ready", detail: "Enabled. Send a message to generate swipes.", run: null } };
       this.owners.set(user, owner); this.emit(owner, "ready", owner.view.detail); return owner.view;
     } finally { if (this.arming.get(user) === attempt) this.arming.delete(user); }
@@ -245,8 +273,24 @@ export class Automation {
     if (owner.armed && owner.takingOver === p.generationId && owner.preparation) {
       owner.takingOver = undefined;
       owner.deadline = setTimeout(() => { void this.fail(owner, "Prompt preparation did not finish. Enable again to retry."); }, 120_000);
-      this.api.sendToFrontend(owner.preparation, user, { frontendSessionId: owner.session });
+      await this.prepare(owner, owner.preparation);
     } else await this.disarm(user, owner.session, true, "Stopped before generating swipes.");
+  }
+  private async prepare(owner: Owner, preparation: Preparation) {
+    let messageId: string | undefined;
+    try {
+      const prompts = await Promise.all(preparation.slots.map(async (_, index) =>
+        (await this.preparePreset(owner.user, owner.session, preparation.runId, index)).prompt));
+      if (owner.preparation !== preparation) return;
+      messageId = (await this.api.chat.appendMessage(preparation.chatId, {
+        role: "assistant", content: "", name: preparation.name, characterId: preparation.characterId,
+        metadata: { another_one_run: preparation.runId },
+      })).id;
+      if (owner.preparation !== preparation) throw new Error("Stopped before generating swipes.");
+      await this.launch(owner.user, owner.session, preparation.runId, messageId, prompts);
+    } catch (error) {
+      await this.preparationFailed(owner.user, owner.session, preparation.runId, errorText(error), preparation.chatId, messageId);
+    }
   }
   async launch(user: string, session: string, runId: string, messageId: string, prompts: PreparedPrompt[]): Promise<boolean> {
     const owner = this.owned(user, session);
@@ -267,7 +311,7 @@ export class Automation {
       const inspection = await this.inspect(owner.chatId, user);
       if (inspection.blockedReason || inspection.busy) throw new Error(inspection.blockedReason || "Another generation started before streaming could begin.");
       chatName = inspection.chatName;
-      if (!owner.armed || owner.preparation?.runId !== runId || !this.leases.valid(user, session)) throw new Error("Cancelled before generating swipes.");
+      if (!owner.armed || owner.preparation?.runId !== runId) throw new Error("Cancelled before generating swipes.");
       if (this.variables) {
         variableState = { version: 1, slots: await Promise.all(prompts.map(async (prompt, index) => {
           const prepared = await owner.prepared?.get(index);
@@ -276,7 +320,7 @@ export class Automation {
         })) };
         if (JSON.stringify(variableState).length > 2_000_000) throw new Error("The combined variable state is too large to save.");
       }
-      if (!owner.armed || owner.preparation?.runId !== runId || !this.leases.valid(user, session)) throw new Error("Cancelled before generating swipes.");
+      if (!owner.armed || owner.preparation?.runId !== runId) throw new Error("Cancelled before generating swipes.");
     } finally { owner.launching = undefined; }
     const mixedPresets = owner.preparation.mixedPresets === true;
     clearTimeout(owner.deadline); owner.preparation = undefined;
@@ -304,17 +348,17 @@ export class Automation {
         await this.api.chat.updateMessage(owner.chatId, messageId, patch);
         if (firstWrite) {
           if (prompts.some(prompt => !prompt.responseContextId)) throw new Error("The prepared response context is missing.");
-          const session = await managedGenerate(this.api).beginMessage({ chatId: owner.chatId, messageId,
-            responseContextIds: prompts.map(prompt => prompt.responseContextId!), userId: user, frontendSessionId: owner.session });
+          const session = await this.api.generate.beginMessage({ chatId: owner.chatId, messageId,
+            responseContextIds: prompts.map(prompt => prompt.responseContextId!), userId: user });
           owner.managedId = session.id;
-          run.abort.signal.addEventListener("abort", () => { void managedGenerate(this.api).abortMessage(session.id).catch(() => {}); }, { once: true });
-          if (run.abort.signal.aborted) await managedGenerate(this.api).abortMessage(session.id);
+          run.abort.signal.addEventListener("abort", () => { void this.api.generate.abortMessage(session.id).catch(() => {}); }, { once: true });
+          if (run.abort.signal.aborted) await this.api.generate.abortMessage(session.id);
         }
         firstWrite = false;
       },
       finalize: async () => {
         if (owner.managedId) {
-          const result = await managedGenerate(this.api).finishMessage(owner.managedId);
+          const result = await this.api.generate.finishMessage(owner.managedId);
           if (!result.completed) run.stop();
         }
         const saved = (await this.api.chat.getMessages(owner.chatId)).find(message => message.id === messageId);
@@ -332,6 +376,7 @@ export class Automation {
     owner.completion = run.run().then(async record => {
       if (!run.deleted) await this.storage.record(user, record);
       owner.current = undefined; owner.managedId = undefined;
+      if (owner.detached) owner.armed = false;
       if (owner.switching) return;
       if (record.outcome === "complete" && owner.armed) this.emit(owner, "ready", `${record.steps.length} ${record.steps.length === 1 ? "swipe" : "swipes"} finished.`);
       else { owner.armed = false; this.release(owner); this.emit(owner, record.outcome === "error" ? "error" : "off", record.detail || "Finished. See each swipe's status below."); }
@@ -341,7 +386,8 @@ export class Automation {
   async fail(owner: Owner, detail: string) {
     const runId = owner.preparation?.runId;
     owner.armed = false; clearTimeout(owner.deadline); owner.preparation = undefined; owner.takingOver = undefined; owner.parent = undefined;
-    owner.current?.stop(detail); this.release(owner); this.emit(owner, "error", detail);
+    owner.prepared = undefined;
+    owner.current?.stop(detail); this.release(owner, owner.detached === true); this.emit(owner, "error", detail);
     if (runId) await this.cancelPreparation(owner, runId);
   }
   async preparationFailed(user: string, session: string, runId: string, error: string, chatId: string, messageId?: string) {

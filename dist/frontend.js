@@ -30,14 +30,6 @@ function errorText(error) {
 }
 
 // src/generation/session.ts
-async function hostRequest(path, body, signal) {
-  const response = await fetch(`/api/v1/${path}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
-  const value = await response.json();
-  if (!response.ok)
-    throw new Error(value.error || `Lumiverse returned ${response.status}.`);
-  return value;
-}
-
 class Session {
   ctx;
   bridge;
@@ -46,8 +38,6 @@ class Session {
   armed = false;
   chatId = null;
   heartbeat;
-  preparing;
-  preparation;
   unsubscribe;
   disposed = false;
   driver;
@@ -62,23 +52,22 @@ class Session {
     this.unsubscribe = ctx.onBackendMessage((raw) => {
       const message = raw;
       if (message.type === "view" && message.view) {
-        if (this.changingChat)
+        if (this.changingChat || message.chatId !== this.driver.chatId())
           return;
         this.viewRevision++;
         this.armed = message.armed === true;
         this.view = message.view;
-        if (this.armed) {
+        const running = this.view.phase === "running" || this.view.phase === "stopping";
+        if (this.armed || running) {
           this.chatId = this.driver.chatId();
           this.startHeartbeat();
         }
-        if (!this.armed && this.view.phase !== "running") {
-          this.preparing?.abort();
+        if (!this.armed && !running) {
           clearInterval(this.heartbeat);
           this.heartbeat = undefined;
         }
         this.changed(this.view);
-      } else if (message.type === "prepare")
-        this.preparation = this.prepare(raw);
+      }
     });
   }
   get generatingChatId() {
@@ -92,9 +81,8 @@ class Session {
     this.heartbeat = setInterval(() => {
       this.bridge.call("heartbeat", {}).then((ok) => {
         if (!ok && this.enabled)
-          this.disable("Control was lost.", true);
+          this.disconnected();
       }).catch((error) => {
-        this.preparing?.abort();
         this.showError(error);
       });
     }, 15000);
@@ -103,7 +91,6 @@ class Session {
     this.navigation++;
     this.changingChat = false;
     this.armed = false;
-    this.preparing?.abort();
     clearInterval(this.heartbeat);
     this.heartbeat = undefined;
     this.view = { phase: "off", detail: "Disconnected. Waiting to reconnect.", run: null };
@@ -175,57 +162,9 @@ class Session {
       this.showError(error);
     }
   }
-  async prepare(message) {
-    if (!this.armed || message.chatId !== this.chatId || this.driver.chatId() !== this.chatId)
-      return;
-    this.preparing?.abort();
-    const abort = new AbortController;
-    this.preparing = abort;
-    let messageId;
-    let creatingReply = false;
-    let launched = false;
-    let failure = "Stopped before generating swipes.";
-    try {
-      const prompts = await Promise.all(message.slots.map(async (slot, stepIndex) => {
-        const prepared = await this.bridge.call("preparePreset", { runId: message.runId, stepIndex });
-        if (abort.signal.aborted)
-          throw new Error("Cancelled while preparing swipes.");
-        if (!prepared.prompt?.responseContextId || !Array.isArray(prepared.prompt.messages))
-          throw new Error("The prepared request is incomplete.");
-        return prepared.prompt;
-      }));
-      if (abort.signal.aborted || !this.armed || this.driver.chatId() !== message.chatId)
-        return;
-      creatingReply = true;
-      const reply = await hostRequest(`chats/${encodeURIComponent(message.chatId)}/messages`, {
-        is_user: false,
-        name: message.name,
-        content: "",
-        extra: { ...message.characterId ? { character_id: message.characterId } : {}, spindle_metadata: { another_one_run: message.runId } }
-      }, AbortSignal.timeout(20000));
-      messageId = reply.id;
-      if (abort.signal.aborted)
-        return;
-      await this.bridge.call("launch", { runId: message.runId, messageId: reply.id, prompts });
-      launched = true;
-    } catch (error) {
-      failure = errorText(error);
-    } finally {
-      if (!launched && (creatingReply || !abort.signal.aborted)) {
-        try {
-          await this.bridge.call("preparationFailed", { runId: message.runId, error: failure, chatId: message.chatId, messageId });
-        } catch (error) {
-          this.showError(error);
-        }
-      }
-      if (this.preparing === abort)
-        this.preparing = undefined;
-    }
-  }
   async disable(_detail, stop = false) {
     this.navigation++;
     this.changingChat = false;
-    this.preparing?.abort();
     this.armed = false;
     const revision = this.viewRevision;
     try {
@@ -261,7 +200,6 @@ class Session {
     }
     const navigation = ++this.navigation;
     this.changingChat = true;
-    this.preparing?.abort();
     this.view = { ...this.view, phase: "preparing", detail: "Opening chat…" };
     this.changed(this.view);
     try {
@@ -291,10 +229,9 @@ class Session {
     this.disposed = true;
     clearInterval(this.heartbeat);
     this.unsubscribe();
-    this.preparing?.abort();
-    if (this.enabled)
-      await this.disable("Extension unloaded.", true);
-    await this.preparation;
+    this.navigation++;
+    this.armed = false;
+    this.view = { phase: "off", detail: "Disconnected", run: null };
   }
 }
 
@@ -334,7 +271,7 @@ class Bridge {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error("CAT's backend did not respond. Check the connection and extension permissions."));
-      }, operation === "preparePreset" ? 120000 : 20000);
+      }, 20000);
       this.pending.set(id, { resolve: (value) => resolve(value), reject, timer });
       try {
         this.ctx.sendToBackend({ type: "request", id, operation, input });
@@ -1941,7 +1878,7 @@ function setup(ctx) {
     const message = raw;
     if (message.type === "activation" && message.activation)
       applyActivation(message.activation);
-    if (message.type === "view")
+    if (message.type === "view" && message.chatId === ctx.state.get("chat.active").chatId)
       stopAction.setEnabled(message.view?.phase === "running" || message.view?.phase === "preparing");
     if (message.type === "historyChanged") {
       load();

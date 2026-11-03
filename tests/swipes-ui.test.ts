@@ -22,6 +22,7 @@ test.each(["a", null])("the Swipes tab stays scoped through startup (%s), naviga
   const root = document.createElement("div"), actions = document.createElement("div"); document.body.append(root, actions);
   let chatId: string | null = initialChatId, badge: string | null = null, heldLoad: string | null = null, delayLoad = false;
   let holdRestore = false, heldRestore: string | null = null;
+  let stopEnabled = false;
   const receive = (raw: unknown) => { for (const listener of listeners) listener(raw); };
   const catalog = () => ({ settings: { version: 1, cats: false, slots: [] }, presets: [], connections: [], history,
     activation: { enabled: false, revision: 0 } });
@@ -29,7 +30,7 @@ test.each(["a", null])("the Swipes tab stays scoped through startup (%s), naviga
   const ctx = {
     frontendSessionId: "session", dom: { addStyle: () => noop, findMessageElement: () => null },
     ui: { registerDrawerTab: () => ({ root, tabId: "tab", setBadge: (value: string | null) => { badge = value; }, destroy: () => root.remove(), onActivate: () => noop }),
-      registerInputBarAction: () => ({ onClick: () => noop, setEnabled: noop, destroy: noop }), mount: () => actions },
+      registerInputBarAction: () => ({ onClick: () => noop, setEnabled: (value: boolean) => { stopEnabled = value; }, destroy: noop }), mount: () => actions },
     state: { get: (key: string) => key === "chat.active" ? { chatId } : { open: false, tabId: "tab" },
       subscribe: (key: string, callback: () => void) => { states.set(key, callback); return () => states.delete(key); } },
     connections: { getActive: () => ({ activeProfileId: "main" }) }, host: { capabilities: { "message-preset-context-v1": true }, surfaces: { invoke: async () => {} } },
@@ -51,7 +52,7 @@ test.each(["a", null])("the Swipes tab stays scoped through startup (%s), naviga
   const dispose = setup(ctx);
   const navigate = (id: string | null) => { chatId = id; states.get("chat.active")!(); };
   const rows = () => Array.from(root.querySelectorAll(".ao-step-copy strong"), el => el.textContent);
-  const show = (record: RunRecord, phase = "off") => receive({ type: "view", armed: false, view: { phase, detail: `Status from ${record.chatId}`, run: record } });
+  const show = (record: RunRecord, phase = "off") => receive({ type: "view", chatId: record.chatId, armed: false, view: { phase, detail: `Status from ${record.chatId}`, run: record } });
   try {
     expect(rows()).toEqual([]);
     await Bun.sleep(2);
@@ -76,6 +77,8 @@ test.each(["a", null])("the Swipes tab stays scoped through startup (%s), naviga
     expect(root.querySelector(".ao-status")!.textContent).not.toContain("Status from a");
     show({ ...currentA, outcome: "running" }, "running");
     expect(rows()).toEqual(["b-latest"]); expect(badge).toBeNull();
+    receive({ type: "view", chatId: "a", armed: true, view: { phase: "preparing", detail: "Preparing chat a", run: null } });
+    expect(stopEnabled).toBe(false); expect(root.textContent).not.toContain("Preparing chat a");
     expect(root.querySelector(".ao-status button")).toBeNull();
     show(currentA);
     navigate(null);

@@ -26,6 +26,7 @@ for (const event of ["GENERATION_ENDED", "GENERATION_STOPPED"] as const) spindle
 });
 
 async function loadCatalog(userId: string, chatId?: string) {
+  if (!spindle.host.capabilities["chat-append-identity-v1"]) throw new Error("Update Lumiverse to a build with background CAT generation support before enabling CAT.");
   if (!spindle.host.capabilities["generation-message-sessions-v1"]) throw new Error("Update Lumiverse to a build with managed message generation before enabling CAT.");
   if (!spindle.host.capabilities["message-preset-context-v1"]) throw new Error("CAT requires a Lumiverse build with per-swipe preset support. Update Lumiverse before enabling CAT.");
   if (!spindle.host.capabilities["chat-swipe-reasoning-v1"]) throw new Error("Update Lumiverse to a build with per-swipe reasoning support before enabling CAT.");
@@ -55,11 +56,12 @@ spindle.onFrontendMessage(async (raw, userId, session) => {
   try {
     let value: unknown;
     switch (msg.operation) {
-      case "load": value = await loadCatalog(userId, typeof input.chatId === "string" ? input.chatId : undefined); break;
+      case "load":
+        value = await loadCatalog(userId, typeof input.chatId === "string" ? input.chatId : undefined);
+        automation.resume(userId, session, typeof input.chatId === "string" ? input.chatId : undefined); break;
       case "activation": value = await automation.setActivation(userId, input); break;
-      case "preparePreset": value = await automation.preparePreset(userId, session, String(input.runId), Number(input.stepIndex)); break;
       case "save": value = await storage.save(userId, input.settings); break;
-      case "heartbeat": value = leases.heartbeat(userId, session); break;
+      case "heartbeat": value = automation.heartbeat(userId, session); break;
       case "arm":
         if (typeof input.chatId !== "string" || typeof input.connectionId !== "string") throw new Error("A chat and connection are required.");
         value = await automation.arm(userId, session, input.chatId, input.connectionId, input.slotIds as string[] | undefined); break;
@@ -76,11 +78,10 @@ spindle.onFrontendMessage(async (raw, userId, session) => {
         const checked = await storage.history(userId, input.chatId);
         const messages = await restoreMessageContexts(spindle, input.chatId, checked);
         await storage.reconcileHistory(userId, checked, messages);
+        automation.resume(userId, session, input.chatId);
         value = { messages, history: await storage.history(userId, input.chatId) }; break;
       }
       case "disarm": value = await automation.disarm(userId, session, input.stop === true); break;
-      case "launch": value = await automation.launch(userId, session, String(input.runId), String(input.messageId), input.prompts as import("../generation/parallel-run").PreparedPrompt[]); break;
-      case "preparationFailed": value = await automation.preparationFailed(userId, session, String(input.runId), String(input.error), String(input.chatId), typeof input.messageId === "string" ? input.messageId : undefined); break;
       case "selectSwipe": {
         const runId = String(input.runId);
         if (typeof input.chatId !== "string") throw new Error("A chat is required.");

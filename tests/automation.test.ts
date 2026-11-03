@@ -62,14 +62,15 @@ function fixture(savedStorage?: Storage, variables?: ConstructorParameters<typeo
     emit("GENERATION_STARTED", { generationId: "native", chatId: "chat", frontendSessionId: "session", generationType: "normal" });
   }
   return { automation, catalog, sent, targets, storage, writes, records, deleted, generated, raw, emit, arm, context: (signal?: AbortSignal) => context(raw, signal),
+    preparation: () => (automation as any).owners.get("user")?.preparation,
     setCouncil: (fn: typeof council) => { council = fn; },
     setRead: (fn: typeof read) => { read = fn; }, setMessages: (value: any[]) => { messages = value; } };
 }
 
 test("final streaming writes preserve metadata added by another extension", async () => {
   const f = fixture(); await f.arm(); await f.context();
-  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
-  const prep = f.sent.find(s => s.type === "prepare");
+
+  const prep = f.preparation();
   const message = { id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } as Record<string, unknown> };
   f.setMessages([message]);
   await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", responseContextId: "context", provider: "custom", model: "fixture" }]);
@@ -88,8 +89,8 @@ test("swipe identities retain asynchronously captured variables and reject faile
         before: { global: snapshot.global, chat: snapshot.chat }, revision: null }; } },
       selection: { sync: async () => {} } } as unknown as ConstructorParameters<typeof Automation>[5];
     const f = fixture(undefined, variables); await f.arm(); await f.context();
-    f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
-    const prep = f.sent.find(s => s.type === "prepare");
+
+    const prep = f.preparation();
     await f.automation.preparePreset("user", "session", prep.runId, 0);
     const message = { id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } as Record<string, any> };
     f.setMessages([message]);
@@ -108,8 +109,8 @@ test("swipe identities retain asynchronously captured variables and reject faile
 
 test("a settled run remains protected from history recovery until its final save finishes", async () => {
   const f = fixture(); await f.arm(); await f.context();
-  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
-  const prep = f.sent.find(s => s.type === "prepare");
+
+  const prep = f.preparation();
   f.setMessages([{ id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } }]);
   let finish!: () => void, writing!: () => void;
   const entered = new Promise<void>(resolve => { writing = resolve; });
@@ -142,8 +143,8 @@ test("profiles can reuse the same preset with different connections", async () =
   f.catalog.settings.slots.push({ id: "second", presetId: "p", connectionId: "other" });
   f.catalog.connections.push({ id: "other", name: "Other connection" });
   await f.arm(); await f.context();
-  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
-  expect(f.sent.find(s => s.type === "prepare").slots.map((s: any) => [s.presetId, s.connectionId])).toEqual([["p", "c"], ["p", "other"]]);
+
+  expect(f.preparation().slots.map((s: any) => [s.presetId, s.connectionId])).toEqual([["p", "c"], ["p", "other"]]);
   await f.automation.disarm("user", "session", true);
 });
 
@@ -154,14 +155,14 @@ test("disabling while the context handler awaits chat data prevents a late takeo
   const pending = f.context();
   await f.automation.disarm("user", "session", true); resolve([]);
   expect(await pending).toBe(f.raw);
-  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
+
   expect(f.sent.some(s => s.type === "prepare")).toBe(false);
 });
 
 test("following a fork stops source streams before transferring ownership and keeps the profile selection", async () => {
   const f = fixture(); await f.arm();
-  await f.context(); f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
-  const prep = f.sent.find(s => s.type === "prepare");
+  await f.context();
+  const prep = f.preparation();
   f.setMessages([{ id: "reply", index_in_chat: 12, name: "Mio", role: "assistant", content: "", metadata: { another_one_run: prep.runId } }]);
   await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", responseContextId: "context", provider: "custom", model: "fixture" }]);
   await Bun.sleep(5);
@@ -178,8 +179,8 @@ test("following a fork stops source streams before transferring ownership and ke
 
 test("deleting a streaming reply clears its view and prevents a late history entry or write", async () => {
   const f = fixture(); await f.arm();
-  await f.context(); f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
-  const prep = f.sent.find(s => s.type === "prepare");
+  await f.context();
+  const prep = f.preparation();
   f.setMessages([{ id: "reply", index_in_chat: 12, name: "Mio", role: "assistant", content: "", metadata: { another_one_run: prep.runId } }]);
   await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", responseContextId: "context", provider: "custom", model: "fixture" }]);
   await Bun.sleep(5);
@@ -194,8 +195,8 @@ test("deleting a streaming reply clears its view and prevents a late history ent
 
 test("prepared model overrides reach raw streaming without mutating the prepared parameters", async () => {
   const f = fixture(); await f.arm(); await f.context();
-  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
-  const prep = f.sent.find(s => s.type === "prepare");
+
+  const prep = f.preparation();
   f.setMessages([{ id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } }]);
   const parameters = { model: " selected-model ", temperature: 0.7 };
   await f.automation.launch("user", "session", prep.runId, "reply", [{ connectionId: "c", responseContextId: "context", provider: "custom", model: "connection-model", parameters,
@@ -215,8 +216,8 @@ test("saved profile selection is nonempty and ordered without a reset after send
   await expect(f.automation.setActivation("user", { slotIds: ["missing"] })).rejects.toThrow();
   await f.automation.setActivation("user", { enabled: true, slotIds: ["second"] });
   expect((await f.context()).cancelGeneration).toBe(true);
-  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
-  expect(f.sent.find(s => s.type === "prepare").slots.map((s: any) => s.presetId)).toEqual(["q"]);
+
+  expect(f.preparation().slots.map((s: any) => s.presetId)).toEqual(["q"]);
   expect(f.sent.filter(s => s.type === "profilesConsumed")).toHaveLength(0);
   expect((await f.storage.activation("user")).slotIds).toEqual(["second"]);
   await f.automation.disarm("user", "session", true);
@@ -232,8 +233,8 @@ test("enable works when the host rejects presets_get_active", async () => {
 test("failed preparation removes only its untouched blank reply, even after disarming", async () => {
   for (const protectedBy of ["none", "text", "stream", "reasoning", "attachment", "other-run"]) {
     const f = fixture(); await f.arm(); await f.context();
-    f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
-    const prep = f.sent.find(s => s.type === "prepare");
+
+    const prep = f.preparation();
     await f.automation.disarm("user", "session", true);
     f.setMessages([{ id: "blank", content: protectedBy === "text" ? "User edit" : "", swipes: [""],
       extra: protectedBy === "reasoning" ? { reasoningBySwipe: ["Thought"] } : protectedBy === "attachment" ? { attachments: [{}] } : {},
@@ -251,16 +252,16 @@ test("an aborted native context is never taken over", async () => {
   await f.automation.disarm("user", "session");
 });
 
-test("saved enable state restores after a worker restart and routes preparation to the sending browser", async () => {
+test("saved enable state restores after a worker restart and routes status to the sending browser", async () => {
   const first = fixture();
   await first.automation.setActivation("user", { enabled: true, slotIds: ["slot"] });
   const restarted = fixture(first.storage);
   restarted.raw.frontendSessionId = "new-browser";
   restarted.emit("GENERATION_STARTED", { generationId: "new-generation", chatId: "chat", frontendSessionId: "new-browser", generationType: "normal" });
   expect((await restarted.context()).cancelGeneration).toBe(true);
-  restarted.emit("GENERATION_STOPPED", { generationId: "new-generation", chatId: "chat" });
-  expect(restarted.sent.at(-1).type).toBe("prepare"); expect(restarted.targets.at(-1)).toBe("new-browser");
-  expect(restarted.sent.at(-1).slots.map((s: any) => s.presetId)).toEqual(["p"]);
+
+  expect(restarted.sent.at(-1).view.phase).toBe("preparing"); expect(restarted.targets.at(-1)).toBe("new-browser");
+  expect(restarted.preparation().slots.map((s: any) => s.presetId)).toEqual(["p"]);
   restarted.emit("FRONTEND_SESSION_CLOSED", { frontendSessionId: "new-browser" });
   expect((await restarted.storage.activation("user")).enabled).toBe(true);
   const disabled = await restarted.automation.setActivation("user", { enabled: false });
@@ -274,7 +275,7 @@ test("a different browser can send with the account preference without stealing 
   f.raw.frontendSessionId = "second-browser";
   f.emit("GENERATION_STARTED", { generationId: "second-generation", chatId: "chat", frontendSessionId: "second-browser", generationType: "normal" });
   expect((await f.context()).cancelGeneration).toBe(true);
-  f.emit("GENERATION_STOPPED", { generationId: "second-generation", chatId: "chat" });
+
   expect(f.targets.at(-1)).toBe("second-browser");
   f.raw.frontendSessionId = "third-browser";
   f.emit("GENERATION_STARTED", { generationId: "third-generation", chatId: "elsewhere", frontendSessionId: "third-browser", generationType: "normal" });
@@ -297,11 +298,46 @@ test("a saved Disable cancels automatic restoration while host inspection is pen
   expect(f.sent.some(s => s.armed)).toBe(false);
 });
 
+test("closing the browser during automatic enable keeps the accepted native send", async () => {
+  const f = fixture(); await f.automation.setActivation("user", { enabled: true });
+  let finish!: (value: any) => void;
+  f.setCouncil(() => new Promise(resolve => { finish = resolve; }));
+  f.emit("GENERATION_STARTED", { generationId: "native", chatId: "chat", frontendSessionId: "session", generationType: "normal" });
+  const pending = f.context();
+  for (let i = 0; !finish && i < 100; i++) await Bun.sleep(1);
+  expect(typeof finish).toBe("function");
+  f.emit("FRONTEND_SESSION_CLOSED", { frontendSessionId: "session" });
+  finish({ councilMode: false, members: [] });
+  expect((await pending).cancelGeneration).toBe(true);
+  expect(f.preparation().chatId).toBe("chat");
+  await f.automation.disarm("user", "session", true);
+});
+
+test("reconnecting before automatic enable finishes routes status and Stop to the returning browser", async () => {
+  const f = fixture(); await f.automation.setActivation("user", { enabled: true });
+  let finish!: (value: any) => void;
+  f.setCouncil(() => new Promise(resolve => { finish = resolve; }));
+  f.emit("GENERATION_STARTED", { generationId: "native", chatId: "chat", frontendSessionId: "session", generationType: "normal" });
+  const pending = f.context();
+  for (let i = 0; !finish && i < 100; i++) await Bun.sleep(1);
+  expect(typeof finish).toBe("function");
+  f.emit("FRONTEND_SESSION_CLOSED", { frontendSessionId: "session" });
+  f.automation.resume("user", "unrelated-browser", "elsewhere");
+  f.automation.resume("user", "returning-browser", "chat");
+  finish({ councilMode: false, members: [] });
+  expect((await pending).cancelGeneration).toBe(true);
+  expect(f.targets.at(-1)).toBe("returning-browser");
+  expect(f.sent.at(-1)).toMatchObject({ type: "view", chatId: "chat", armed: true, view: { phase: "preparing" } });
+  expect(f.automation.heartbeat("user", "returning-browser")).toBe(true);
+  await f.automation.disarm("user", "returning-browser", true);
+  expect(f.preparation()).toBeUndefined();
+});
+
 test("native swipe navigation keeps streams alive; deleting a swipe stops further writes", async () => {
   const f = fixture(); await f.arm();
   expect((await f.context()).cancelGeneration).toBe(true);
-  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
-  const prep = f.sent.find(s => s.type === "prepare");
+
+  const prep = f.preparation();
   f.setMessages([{ id: "reply", role: "assistant", content: "", metadata: { another_one_run: prep.runId } }]);
   await f.automation.launch("user", "session", prep.runId, "reply", [{ messages: [{ role: "user", content: "Hi" }], parameters: {}, connectionId: "c", responseContextId: "context", provider: "custom", model: "fixture" }]);
   await Bun.sleep(5);
