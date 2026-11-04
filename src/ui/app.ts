@@ -166,10 +166,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     select: async slotIds => { applyActivation(await bridge.call("activation", { slotIds })); },
     manage: () => { selected = "settings"; render(); tab.activate(); }, refreshCats, error: error => { notice.textContent = errorText(error); } });
   const updateStopAction = ctx.onBackendMessage(raw => {
-    const message = raw as { type: string; chatId?: string; view?: { phase: string }; error?: string; activation?: Activation };
+    const message = raw as { type: string; view?: { phase: string }; error?: string; activation?: Activation };
     if (message.type === "activation" && message.activation) applyActivation(message.activation);
-    if (message.type === "view" && message.chatId === ctx.state!.get<{ chatId: string | null }>("chat.active").chatId)
-      stopAction.setEnabled(message.view?.phase === "running" || message.view?.phase === "preparing");
+    if (message.type === "view") stopAction.setEnabled(message.view?.phase === "running" || message.view?.phase === "preparing");
     if (message.type === "historyChanged") { void load(); restoreContexts(); }
     if (message.type === "variableError") notice.textContent = message.error || "The selected swipe's variables could not be applied.";
   });

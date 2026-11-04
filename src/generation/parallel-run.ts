@@ -2,7 +2,7 @@ import type { LlmMessageDTO, StreamChunkDTO } from "lumiverse-spindle-types";
 import { errorText, type RunRecord } from "../shared";
 import { contentHash } from "./preset-context";
 
-export interface PreparedPrompt { messages: LlmMessageDTO[]; parameters: Record<string, unknown>; connectionId: string; provider: string; model: string; prefill?: string; captureToken?: string; responseContextId?: string; variableState?: import("./variable-state").VariableSnapshot; cacheCheckId?: string }
+export interface PreparedPrompt { messages: LlmMessageDTO[]; parameters: Record<string, unknown>; connectionId: string; provider: string; model: string; prefill?: string; captureToken?: string; responseContextId?: string; variableState?: import("./variable-state").VariableSnapshot }
 export interface SwipeReasoning { text: string | null; duration: number | null }
 export interface ParallelDriver {
   stream(prompt: PreparedPrompt, signal: AbortSignal): AsyncIterable<StreamChunkDTO>;

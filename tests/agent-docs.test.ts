@@ -58,3 +58,11 @@ test("docs reject malformed, unknown and write requests without exposing control
   await expect(f.call({ op: "activation", enabled: true })).rejects.toThrow("only serves documentation");
   expect((await f.call({ op: "read_item", surfaceId: "cat_docs", itemId: "overview" })).value).toContain("CAT (Concurrent");
 });
+
+test("generation help describes browser-dependent execution without cache review", async () => {
+  const f = fixture();
+  const { value } = await f.call({ op: "read_item", surfaceId: "cat_docs", itemId: "generation" });
+  expect(value).toContain("Keep the controlling browser tab open");
+  expect(value).not.toContain("closing the browser does not stop it");
+  expect(value).not.toContain("all profile prompts pass review");
+});

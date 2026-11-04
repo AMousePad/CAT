@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import type { SpindleFrontendContext } from "lumiverse-spindle-types";
 import type { Bridge } from "../src/ui/bridge";
 import type { Catalog, RunRecord } from "../src/shared";
@@ -12,11 +12,17 @@ function fixture() {
   let follow: () => Promise<any> = async () => ({ phase: "ready", detail: "Ready", run: null });
   let arm = async () => ({ phase: "ready", detail: "", run: null });
   let receive: (raw: unknown) => void = () => {};
+  let prepare: (input: any) => Promise<any> = async input => {
+    const slot = catalog.settings.slots[input.stepIndex];
+    return { presetId: slot.presetId, token: `capture-${input.stepIndex}`, prompt: { responseContextId: `context-${input.stepIndex}`,
+      captureToken: `capture-${input.stepIndex}`, connectionId: slot.connectionId || "main", messages: [{ role: "user", content: "Hi" }],
+      parameters: {}, provider: "custom", model: "fixture" } };
+  };
   const bridge = { call: async (operation: string, input: any) => {
     calls.push({ operation, input });
     if (operation === "followFork") return follow();
-    if (operation === "heartbeat") return true;
-    if (operation === "selectSwipe") return true;
+    if (operation === "selectSwipe" || operation === "launch" || operation === "preparationFailed") return true;
+    if (operation === "preparePreset") return prepare(input);
     if (operation === "arm") return arm();
     if (operation === "disarm") return disarm();
     throw new Error(`Unexpected operation: ${operation}`);
@@ -30,13 +36,13 @@ function fixture() {
     } } },
   } as unknown as SpindleFrontendContext;
   const catalog: Catalog = { settings: { version: 1, cats: false, slots: [{ id: "slot", presetId: "source", connectionId: null }] }, presets: [{ id: "source", name: "Source" }], connections: [{ id: "main", name: "Main" }] };
-  return { state, actions, catalog, calls, setDisarm: (fn: typeof disarm) => { disarm = fn; }, setArm: (fn: typeof arm) => { arm = fn; }, setFollow: (fn: typeof follow) => { follow = fn; }, receive: (raw: unknown) => receive(raw), make: () => new Session(ctx, bridge, () => {}) };
+  return { state, actions, catalog, calls, setPrepare: (fn: typeof prepare) => { prepare = fn; }, setDisarm: (fn: typeof disarm) => { disarm = fn; }, setArm: (fn: typeof arm) => { arm = fn; }, setFollow: (fn: typeof follow) => { follow = fn; }, receive: (raw: unknown) => receive(raw), make: () => new Session(ctx, bridge, () => {}) };
 }
 
 test("Stop cancels backend streams and keeps the composer busy through the final save", async () => {
   const f = fixture(), session = f.make();
   await session.enable(f.catalog); expect(session.generatingChatId).toBeNull();
-  const view = (phase: string) => f.receive({ type: "view", chatId: "chat", armed: true, view: { phase, detail: "", run: null } });
+  const view = (phase: string) => f.receive({ type: "view", armed: true, view: { phase, detail: "", run: null } });
   view("preparing"); view("running"); view("running");
   expect(session.generatingChatId).toBe("chat");
   f.setDisarm(async () => ({ phase: "running", detail: "Stopping", run: null }));
@@ -51,11 +57,11 @@ test("Stop cancels backend streams and keeps the composer busy through the final
 test("composer controls clear on completion, failure, disconnect, navigation and unload", async () => {
   for (const end of ["ready", "error", "disconnect", "navigate", "dispose"]) {
     const f = fixture(), session = f.make(); await session.enable(f.catalog);
-    f.receive({ type: "view", chatId: "chat", armed: true, view: { phase: "running", detail: "", run: null } });
+    f.receive({ type: "view", armed: true, view: { phase: "running", detail: "", run: null } });
     if (end === "disconnect") session.disconnected();
     else if (end === "dispose") await session.dispose();
     else if (end === "navigate") { f.state.chat = "fork"; await session.chatChanged(); }
-    else f.receive({ type: "view", chatId: "chat", armed: true, view: { phase: end, detail: "", run: null } });
+    else f.receive({ type: "view", armed: true, view: { phase: end, detail: "", run: null } });
     expect(session.generatingChatId).toBeNull();
     await session.dispose();
   }
@@ -63,11 +69,11 @@ test("composer controls clear on completion, failure, disconnect, navigation and
 
 test("a delayed Stop acknowledgement cannot replace the final saved state", async () => {
   const f = fixture(), session = f.make(); await session.enable(f.catalog);
-  f.receive({ type: "view", chatId: "chat", armed: true, view: { phase: "running", detail: "", run: null } });
+  f.receive({ type: "view", armed: true, view: { phase: "running", detail: "", run: null } });
   let finish!: (value: any) => void;
   f.setDisarm(() => new Promise(resolve => { finish = resolve; }));
   const stopping = session.disable("Stopped", true);
-  f.receive({ type: "view", chatId: "chat", armed: false, view: { phase: "off", detail: "Saved", run: null } });
+  f.receive({ type: "view", armed: false, view: { phase: "off", detail: "Saved", run: null } });
   finish({ phase: "running", detail: "Stopping", run: null }); await stopping;
   expect(session.view.phase).toBe("off"); expect(session.generatingChatId).toBeNull();
   await session.dispose();
@@ -84,7 +90,7 @@ test("late enable replies cannot undo Disable, unload, or navigation", async () 
     else await session.disable();
     finish({ phase: "ready", detail: "", run: null }); await enabling;
     expect(session.armed).toBe(false); expect(session.enabled).toBe(false);
-    expect(f.calls.some(c => c.operation === "disarm")).toBe(action !== "dispose");
+    expect(f.calls.some(c => c.operation === "disarm")).toBe(true);
     await session.dispose();
   }
 });
@@ -121,13 +127,40 @@ test("a manual preset selection is preserved when disabling", async () => {
 
 test("a restored backend session prepares the next send; disconnect and unload never save Disable", async () => {
   const f = fixture(), session = f.make();
-  f.receive({ type: "view", chatId: "chat", armed: true, view: { phase: "preparing", detail: "Preparing", run: null } });
+  f.receive({ type: "view", armed: true, view: { phase: "preparing", detail: "Preparing", run: null } });
   expect(session.armed).toBe(true);
   session.disconnected(); expect(session.armed).toBe(false);
   expect(f.calls).toEqual([]);
-  f.receive({ type: "view", chatId: "chat", armed: true, view: { phase: "ready", detail: "Enabled", run: null } });
+  f.receive({ type: "view", armed: true, view: { phase: "ready", detail: "Enabled", run: null } });
   await session.dispose();
-  expect(f.calls).toEqual([]);
+  expect(f.calls.map(c => c.operation)).toEqual(["disarm"]);
+});
+
+test("backend-prepared media and variable snapshots reach launch unchanged without changing the user's preset", async () => {
+  const f = fixture(), session = f.make(), previousFetch = globalThis.fetch;
+  f.catalog.settings.slots.push({ id: "second", presetId: "second-source", connectionId: "alternate" });
+  const prepared: any[] = [];
+  f.setPrepare(async input => {
+    const slot = f.catalog.settings.slots[input.stepIndex];
+    const prompt = { responseContextId: `context-${input.stepIndex}`, captureToken: `capture-${input.stepIndex}`,
+      connectionId: slot.connectionId || "main", parameters: {}, provider: "custom", model: slot.connectionId || "main",
+      messages: [{ role: "user", content: [{ type: "audio", data: "UklGRg==", mime_type: "audio/wav" }] },
+        { role: "assistant", content: "Reply", reasoning_content: "Thought", thinking_blocks: [{ type: "thinking", thinking: "Signed", signature: "signature" }] }],
+      variableState: { local: { tone: slot.presetId }, global: {}, chat: {} } };
+    prepared.push(prompt); return { token: prompt.captureToken, presetId: slot.presetId, prompt };
+  });
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: string) => { urls.push(url); return Response.json({ id: "reply" }); }) as typeof fetch;
+  try {
+    await session.enable(f.catalog); f.state.preset = "manually-selected";
+    f.receive({ type: "prepare", runId: "run", chatId: "chat", name: "Cat", slots: [
+      { presetId: "source", connectionId: "main" }, { presetId: "second-source", connectionId: "alternate" },
+    ] });
+    await Bun.sleep(5);
+    expect(f.calls.find(call => call.operation === "launch")!.input.prompts).toEqual(prepared);
+    expect(urls).toEqual(["/api/v1/chats/chat/messages"]);
+    expect(f.state.preset).toBe("manually-selected"); expect(f.actions).toEqual([]);
+  } finally { globalThis.fetch = previousFetch; await session.dispose(); }
 });
 
 test("opening a fork keeps the session enabled without switching the user's preset", async () => {
@@ -137,6 +170,42 @@ test("opening a fork keeps the session enabled without switching the user's pres
   expect(f.calls.filter(c => c.operation === "disarm")).toHaveLength(0);
   expect(f.calls.find(c => c.operation === "followFork")?.input).toEqual({ chatId: "fork" });
   await session.disable(); expect(f.state.preset).toBe("source"); await session.dispose();
+});
+
+test("an incomplete backend preparation fails before creating a reply", async () => {
+  const f = fixture(), session = f.make(), previousFetch = globalThis.fetch;
+  f.setPrepare(async () => ({ token: "capture", presetId: "source", prompt: { messages: [] } }));
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: string) => { urls.push(url); return Response.json({ id: "reply" }); }) as typeof fetch;
+  try {
+    await session.enable(f.catalog);
+    f.receive({ type: "prepare", runId: "run", chatId: "chat", name: "Cat", slots: [{ presetId: "source", connectionId: "main" }] });
+    await Bun.sleep(5);
+    expect(urls).toHaveLength(0); expect(f.calls.some(call => call.operation === "launch")).toBe(false);
+    expect(f.calls.find(call => call.operation === "preparationFailed")?.input.error).toContain("incomplete");
+  } finally { globalThis.fetch = previousFetch; await session.dispose(); }
+});
+
+test.each([false, true])("cancellation during reply creation cleans up before unload, with response loss %s", async lost => {
+  const f = fixture(), session = f.make(), previousFetch = globalThis.fetch;
+  let acknowledge!: () => void;
+  let creating!: () => void;
+  const created = new Promise<void>(resolve => { creating = resolve; });
+  globalThis.fetch = (async (url: string, options: RequestInit) => {
+    if (url.includes("dry-run")) return Response.json({ request_messages: [{ role: "user", content: "Hi" }], parameters: {}, provider: "custom", model: "fixture" });
+    return new Promise<Response>((resolve, reject) => {
+      options.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      acknowledge = () => lost ? reject(new Error("Response lost after creating the reply")) : resolve(Response.json({ id: "late-reply" })); creating();
+    });
+  }) as typeof fetch;
+  try {
+    await session.enable(f.catalog);
+    f.receive({ type: "prepare", runId: "run", chatId: "chat", name: "Cat", slots: [{ presetId: "source", connectionId: "main" }] });
+    await created;
+    const disposing = session.dispose(); acknowledge(); await disposing;
+    expect(f.calls.some(c => c.operation === "launch")).toBe(false);
+    expect(f.calls.find(c => c.operation === "preparationFailed")?.input).toMatchObject({ runId: "run", chatId: "chat", messageId: lost ? undefined : "late-reply" });
+  } finally { globalThis.fetch = previousFetch; }
 });
 
 test("opening an unrelated chat still disables; a late fork response cannot undo Disable", async () => {
@@ -159,48 +228,4 @@ test("returning to the original chat while a fork opens cancels the pending tran
   f.state.chat = "chat"; await session.chatChanged();
   resolve({ phase: "ready", detail: "Ready", run: null }); await changing;
   expect(session.armed).toBe(false); expect(f.state.preset).toBe("source"); await session.dispose();
-});
-
-
-test("unloading during preparation or streaming leaves backend work running", async () => {
-  for (const phase of ["preparing", "running"]) {
-    const f = fixture(), session = f.make(); await session.enable(f.catalog);
-    f.receive({ type: "view", chatId: "chat", armed: true, view: { phase, detail: "", run: null } });
-    await session.dispose();
-    expect(f.calls.map(call => call.operation)).toEqual(["arm"]);
-    expect(session.enabled).toBe(false);
-  }
-});
-
-test("a delayed status for another chat cannot take over the current composer", async () => {
-  const f = fixture(), session = f.make();
-  f.state.chat = "other";
-  f.receive({ type: "view", chatId: "chat", armed: true, view: { phase: "preparing", detail: "Preparing", run: null } });
-  expect(session.generatingChatId).toBeNull(); expect(session.enabled).toBe(false);
-  f.state.chat = "chat";
-  f.receive({ type: "view", chatId: "chat", armed: true, view: { phase: "preparing", detail: "Preparing", run: null } });
-  expect(session.generatingChatId).toBe("chat");
-  await session.dispose();
-});
-
-test("a resumed disabled run renews its lease until completion", async () => {
-  const interval = globalThis.setInterval;
-  let heartbeat!: () => void;
-  const timer = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number) => {
-    heartbeat = fn; return interval(fn, ms);
-  }) as typeof setInterval);
-  const f = fixture(), session = f.make();
-  try {
-    f.receive({ type: "view", chatId: "chat", armed: false, view: { phase: "running", detail: "Disabled; finishing", run: null } });
-    expect(session.armed).toBe(false); expect(session.generatingChatId).toBe("chat");
-    expect(typeof heartbeat).toBe("function");
-    heartbeat(); await Bun.sleep(0);
-    expect(f.calls.map(call => call.operation)).toEqual(["heartbeat"]);
-    session.disconnected();
-    f.receive({ type: "view", chatId: "chat", armed: false, view: { phase: "running", detail: "Reconnected", run: null } });
-    heartbeat(); await Bun.sleep(0);
-    expect(f.calls.map(call => call.operation)).toEqual(["heartbeat", "heartbeat"]);
-    f.receive({ type: "view", chatId: "chat", armed: false, view: { phase: "off", detail: "Finished", run: null } });
-    expect(session.generatingChatId).toBeNull(); expect(session.enabled).toBe(false);
-  } finally { await session.dispose(); timer.mockRestore(); }
 });

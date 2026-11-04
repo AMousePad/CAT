@@ -1,4 +1,5 @@
 import type { Activation, ActivationPatch, Catalog, MessageSummary, RunRecord, Settings } from "./shared";
+import type { PreparedPrompt } from "./generation/parallel-run";
 import type { ViewState } from "./shared";
 export interface Preparation {
   type: "prepare"; runId: string; chatId: string; name: string; characterId?: string; personaId?: string;
@@ -6,6 +7,7 @@ export interface Preparation {
   mixedPresets?: boolean;
 }
 export interface Operations {
+  preparePreset: { input: { runId: string; stepIndex: number }; output: { token: string; presetId: string; prompt: PreparedPrompt } };
   load: { input: { chatId?: string }; output: Catalog & { history: RunRecord[]; activation: Activation } };
   activation: { input: ActivationPatch; output: Activation };
   save: { input: { settings: Settings }; output: Settings };
@@ -14,6 +16,8 @@ export interface Operations {
   followFork: { input: { chatId: string }; output: ViewState | null };
   restoreContexts: { input: { chatId: string }; output: { messages: Record<string, MessageSummary | null>; history: RunRecord[] } };
   disarm: { input: { stop?: boolean }; output: ViewState };
+  launch: { input: { runId: string; messageId: string; prompts: PreparedPrompt[] }; output: boolean };
+  preparationFailed: { input: { runId: string; error: string; chatId: string; messageId?: string }; output: boolean };
   selectSwipe: { input: { chatId: string; runId: string; stepIndex: number }; output: boolean };
 }
 export type Reply = { type: "reply"; id: string; value?: unknown; error?: string };

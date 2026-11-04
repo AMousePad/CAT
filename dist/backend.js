@@ -389,74 +389,7 @@ class ParallelRun {
   }
 }
 
-// src/backend/lumicache.ts
-var POLICY = { requires: ["generation"] };
-var REVIEW_LIMIT_MS = 300000;
-var notRegistered = (error) => /not registered/i.test(errorText(error));
-
-class LumiCacheLink {
-  api;
-  pollMs;
-  tail = Promise.resolve();
-  constructor(api, pollMs = 150) {
-    this.api = api;
-    this.pollMs = pollMs;
-  }
-  send(request) {
-    const work = this.tail.then(async () => {
-      this.api.rpcPool.sync("cache_request", request, POLICY);
-      try {
-        await this.api.rpcPool.read("lumicache.cat");
-      } finally {
-        this.api.rpcPool.sync("cache_request", null, POLICY);
-      }
-    });
-    this.tail = work.catch(() => {});
-    return work;
-  }
-  async check(input, cancelled) {
-    try {
-      await this.send({ op: "check", ...input });
-    } catch (error) {
-      if (notRegistered(error))
-        return null;
-      throw error;
-    }
-    const deadline = Date.now() + REVIEW_LIMIT_MS;
-    while (Date.now() < deadline) {
-      if (cancelled()) {
-        await this.send({ op: "cancel", id: input.id });
-        throw new Error("Stopped before generating swipes.");
-      }
-      const result = await this.read(input.id);
-      if (result?.status === "done")
-        return result.messages;
-      if (result?.status === "error")
-        throw new Error(result.error);
-      await Bun.sleep(this.pollMs);
-    }
-    throw new Error("LumiCache did not answer in time. Retry sending.");
-  }
-  async read(id) {
-    try {
-      return await this.api.rpcPool.read(`lumicache.cat_result.${id}`);
-    } catch (error) {
-      if (notRegistered(error))
-        return null;
-      throw error;
-    }
-  }
-  finish(id, userId, success) {
-    return this.send({ op: "finish", id, userId, success });
-  }
-}
-
 // src/backend/automation.ts
-var streamModel = (prompt) => {
-  const model = prompt.parameters.model;
-  return typeof model === "string" && model.trim() ? model.trim() : prompt.model;
-};
-
 class Automation {
   api;
   storage;
@@ -468,7 +401,6 @@ class Automation {
   owners = new Map;
   arming = new Map;
   active = new Map;
-  cache;
   constructor(api, storage, leases, catalog, inspect, variables, prepareChat) {
     this.api = api;
     this.storage = storage;
@@ -477,8 +409,6 @@ class Automation {
     this.inspect = inspect;
     this.variables = variables;
     this.prepareChat = prepareChat;
-    if (api.rpcPool)
-      this.cache = new LumiCacheLink(api);
     api.on("GENERATION_STARTED", (payload, user) => {
       if (user)
         this.started(payload, user);
@@ -487,16 +417,11 @@ class Automation {
       if (!user)
         return;
       const { frontendSessionId } = raw;
-      const attempt = this.arming.get(user);
-      if (attempt?.session === frontendSessionId) {
-        if (attempt.background)
-          attempt.detached = true;
-        else
-          this.arming.delete(user);
-      }
+      if (this.arming.get(user)?.session === frontendSessionId)
+        this.arming.delete(user);
       const owner = this.owners.get(user);
-      if (owner?.session === frontendSessionId)
-        this.detach(owner);
+      if (owner?.session === frontendSessionId && owner.armed)
+        this.disarm(user, frontendSessionId, true, "Browser disconnected. Partial replies saved.");
     });
     api.on("GENERATION_STOPPED", (p, user) => {
       if (user)
@@ -568,8 +493,10 @@ class Automation {
       if (!owner.parent || owner.current || owner.preparation)
         return raw;
       const parent = owner.parent;
-      if (!owner.detached)
-        this.leases.claim(owner.user, owner.session);
+      if (!this.leases.heartbeat(owner.user, owner.session)) {
+        await this.fail(owner, "The browser connection expired. Enable again.");
+        return raw;
+      }
       await this.variables?.selection.sync(owner.user, owner.chatId);
       const messages = await api.chat.getMessages(owner.chatId);
       if (signal?.aborted || !owner.armed || this.owners.get(owner.user) !== owner || owner.parent !== parent || owner.current || owner.preparation)
@@ -597,45 +524,13 @@ class Automation {
     setInterval(() => {
       for (const owner of this.owners.values())
         if ((owner.armed || owner.current) && !this.leases.valid(owner.user, owner.session)) {
-          this.detach(owner);
+          this.fail(owner, "The controlling browser disconnected. Partial replies have been kept.");
         }
     }, 15000).unref?.();
   }
   emit(owner, phase, detail) {
     owner.view = { ...owner.view, phase, detail };
-    if (owner.detached)
-      return;
-    this.api.sendToFrontend({ type: "view", chatId: owner.chatId, view: owner.view, armed: owner.armed }, owner.user, { frontendSessionId: owner.session });
-  }
-  detach(owner) {
-    owner.detached = true;
-    this.leases.release(owner.user, owner.session);
-    if (!owner.parent && !owner.preparation && !owner.current) {
-      owner.armed = false;
-      this.release(owner, owner.view.phase === "error");
-    }
-  }
-  resume(user, session, chatId) {
-    const attempt = this.arming.get(user);
-    if (attempt?.background && attempt.chatId === chatId && (attempt.detached || attempt.session === session)) {
-      attempt.session = session;
-      attempt.detached = false;
-    }
-    const owner = this.owners.get(user);
-    if (!owner || owner.chatId !== chatId || owner.session !== session && !owner.detached && this.leases.valid(user, owner.session))
-      return;
-    this.leases.release(user, owner.session);
-    owner.session = session;
-    owner.detached = false;
-    this.leases.claim(user, session);
-    this.emit(owner, owner.view.phase, owner.view.detail);
-  }
-  heartbeat(user, session) {
-    const owner = this.owners.get(user);
-    if (!owner || owner.session !== session)
-      return false;
-    this.resume(user, session, owner.chatId);
-    return true;
+    this.api.sendToFrontend({ type: "view", view: owner.view, armed: owner.armed }, owner.user, { frontendSessionId: owner.session });
   }
   owned(user, session) {
     const owner = this.owners.get(user);
@@ -643,9 +538,9 @@ class Automation {
       throw new Error("Enable CAT in this browser first.");
     return owner;
   }
-  release(owner, preserveView = false) {
+  release(owner) {
     this.leases.release(owner.user, owner.session);
-    if (!preserveView && !owner.current && this.owners.get(owner.user) === owner)
+    if (!owner.current && this.owners.get(owner.user) === owner)
       this.owners.delete(owner.user);
   }
   getRun(user, runId) {
@@ -702,7 +597,7 @@ class Automation {
       throw new Error("Wait for the swipes to finish or press Stop.");
     if (this.arming.has(user))
       throw new Error("CAT is already enabling. Wait for it to finish.");
-    const attempt = { session, chatId, background: !!nativeGenerationId, detached: false };
+    const attempt = { session };
     this.arming.set(user, attempt);
     try {
       await this.prepareChat?.(user, chatId);
@@ -731,18 +626,17 @@ class Automation {
       const latest = this.owners.get(user);
       if (latest?.current || latest?.preparation)
         throw new Error("Swipes are already generating. Press Stop first.");
-      if (!this.leases.claim(user, attempt.session))
+      if (!this.leases.claim(user, session))
         throw new Error("Another browser controls CAT. Disable it there first.");
       const owner = {
         user,
-        session: attempt.session,
+        session,
         chatId,
         armed: true,
         slots,
         configured: slots,
         nextIds,
         catalog,
-        detached: attempt.detached,
         view: { phase: "ready", detail: "Enabled. Send a message to generate swipes.", run: null }
       };
       this.owners.set(user, owner);
@@ -844,73 +738,12 @@ class Automation {
     owner.parent = undefined;
     if (owner.armed && owner.takingOver === p.generationId && owner.preparation) {
       owner.takingOver = undefined;
-      this.armDeadline(owner);
-      await this.prepare(owner, owner.preparation);
+      owner.deadline = setTimeout(() => {
+        this.fail(owner, "Prompt preparation did not finish. Enable again to retry.");
+      }, 120000);
+      this.api.sendToFrontend(owner.preparation, user, { frontendSessionId: owner.session });
     } else
       await this.disarm(user, owner.session, true, "Stopped before generating swipes.");
-  }
-  armDeadline(owner) {
-    clearTimeout(owner.deadline);
-    owner.deadline = setTimeout(() => {
-      this.fail(owner, "Prompt preparation did not finish. Enable again to retry.");
-    }, 120000);
-  }
-  async checkCache(owner, preparation, prompts) {
-    if (!this.cache)
-      return;
-    clearTimeout(owner.deadline);
-    for (const [index, prompt] of prompts.entries()) {
-      const slot = owner.slots[index];
-      const id = crypto.randomUUID();
-      const messages = await this.cache.check({
-        id,
-        userId: owner.user,
-        chatId: preparation.chatId,
-        slotId: slot.id,
-        label: `CAT ${owner.catalog.presets.find((preset) => preset.id === slot.presetId)?.name ?? slot.presetId}`,
-        connectionId: prompt.connectionId,
-        model: streamModel(prompt),
-        session: owner.session,
-        messages: withPresetNote(prompt.messages, preparation.mixedPresets === true)
-      }, () => owner.preparation !== preparation);
-      if (!messages)
-        break;
-      prompt.messages = messages;
-      prompt.cacheCheckId = id;
-    }
-    this.armDeadline(owner);
-  }
-  finishCache(owner, prompts, done) {
-    const reports = prompts.flatMap((prompt, index) => prompt.cacheCheckId ? [this.cache.finish(prompt.cacheCheckId, owner.user, done(index))] : []);
-    return Promise.all(reports);
-  }
-  async prepare(owner, preparation) {
-    let messageId;
-    let checked = [];
-    try {
-      const prompts = await Promise.all(preparation.slots.map(async (_, index) => (await this.preparePreset(owner.user, owner.session, preparation.runId, index)).prompt));
-      if (owner.preparation !== preparation)
-        return;
-      checked = prompts;
-      await this.checkCache(owner, preparation, prompts);
-      if (owner.preparation !== preparation) {
-        await this.finishCache(owner, prompts, () => false);
-        return;
-      }
-      messageId = (await this.api.chat.appendMessage(preparation.chatId, {
-        role: "assistant",
-        content: "",
-        name: preparation.name,
-        characterId: preparation.characterId,
-        metadata: { another_one_run: preparation.runId }
-      })).id;
-      if (owner.preparation !== preparation)
-        throw new Error("Stopped before generating swipes.");
-      await this.launch(owner.user, owner.session, preparation.runId, messageId, prompts);
-    } catch (error) {
-      await this.preparationFailed(owner.user, owner.session, preparation.runId, errorText(error), preparation.chatId, messageId);
-      await this.finishCache(owner, checked, () => false).catch((reason) => this.emit(owner, "error", `Could not update LumiCache: ${errorText(reason)}`));
-    }
   }
   async launch(user, session, runId, messageId, prompts) {
     const owner = this.owned(user, session);
@@ -935,7 +768,7 @@ class Automation {
       if (inspection.blockedReason || inspection.busy)
         throw new Error(inspection.blockedReason || "Another generation started before streaming could begin.");
       chatName = inspection.chatName;
-      if (!owner.armed || owner.preparation?.runId !== runId)
+      if (!owner.armed || owner.preparation?.runId !== runId || !this.leases.valid(user, session))
         throw new Error("Cancelled before generating swipes.");
       if (this.variables) {
         variableState = { version: 1, slots: await Promise.all(prompts.map(async (prompt, index) => {
@@ -947,7 +780,7 @@ class Automation {
         if (JSON.stringify(variableState).length > 2000000)
           throw new Error("The combined variable state is too large to save.");
       }
-      if (!owner.armed || owner.preparation?.runId !== runId)
+      if (!owner.armed || owner.preparation?.runId !== runId || !this.leases.valid(user, session))
         throw new Error("Cancelled before generating swipes.");
     } finally {
       owner.launching = undefined;
@@ -974,14 +807,14 @@ class Automation {
       }))
     }, prompts, {
       stream: (prompt, signal) => {
-        const { model: _model, ...parameters } = prompt.parameters;
+        const { model, ...parameters } = prompt.parameters;
         const request = {
           type: "raw",
           userId: user,
           connection_id: prompt.connectionId,
           provider: prompt.provider,
-          model: streamModel(prompt),
-          messages: prompt.cacheCheckId ? prompt.messages : withPresetNote(prompt.messages, mixedPresets),
+          model: typeof model === "string" && model.trim() ? model.trim() : prompt.model,
+          messages: withPresetNote(prompt.messages, mixedPresets),
           parameters,
           signal,
           sessionId: owner.managedId,
@@ -1019,7 +852,8 @@ class Automation {
             chatId: owner.chatId,
             messageId,
             responseContextIds: prompts.map((prompt) => prompt.responseContextId),
-            userId: user
+            userId: user,
+            frontendSessionId: owner.session
           });
           owner.managedId = session.id;
           run.abort.signal.addEventListener("abort", () => {
@@ -1058,13 +892,10 @@ class Automation {
     });
     owner.current = run;
     owner.completion = run.run().then(async (record) => {
-      await this.finishCache(owner, prompts, (index) => record.steps[index]?.status === "done");
       if (!run.deleted)
         await this.storage.record(user, record);
       owner.current = undefined;
       owner.managedId = undefined;
-      if (owner.detached)
-        owner.armed = false;
       if (owner.switching)
         return;
       if (record.outcome === "complete" && owner.armed)
@@ -1087,9 +918,8 @@ class Automation {
     owner.preparation = undefined;
     owner.takingOver = undefined;
     owner.parent = undefined;
-    owner.prepared = undefined;
     owner.current?.stop(detail);
-    this.release(owner, owner.detached === true);
+    this.release(owner);
     this.emit(owner, "error", detail);
     if (runId)
       await this.cancelPreparation(owner, runId);
@@ -1702,25 +1532,25 @@ var DOCS_HINT = 'CAT help: list_external({surface_id:"cat_docs"}), then read_ext
 var topics = [
   { id: "overview", label: "Setup, scope, cost", text: `CAT (Concurrent Alternate Trajectories; extension another_one) generates parallel alternate swipes of one assistant message. Each selected profile has its own preset and connection/model, with streaming, reasoning, regex rendering and variables retained per swipe.
 Start: CAT sidebar > Settings > Add profile; choose preset and optional connection; open a supported chat; Enable; send normally. Swipes tab shows runs; composer cat icon selects profiles and toggles CAT. Read profiles for configuration, generation for lifecycle, swipes for history/state, troubleshooting for limits.
-One selected profile = one model request: N profiles incur N requests. Separate connections per profile may help provider cache setups; CAT does not guarantee caching. LumiCache can review prepared requests.
+One selected profile = one model request: N profiles incur N requests. Separate connections per profile may help provider cache setups; CAT does not guarantee caching.
 This bridge serves documentation only. It cannot inspect/change CAT settings, enable/disable, generate, select swipes or stop requests. Guide the user through CAT UI; do not invent CAT agent tools or edit its private storage.` },
   { id: "profiles", label: "Profiles, connections, hotbar", text: `CAT > Settings: Add profile (maximum 20); select a native Lumiverse preset and explicit connection or "Connection active when enabled". The latter resolves when CAT arms for that chat/send, not independently midway through a run. Duplicate presets/connections are allowed. Remove with \xD7; drag to reorder or use Up/Down on the drag handle. Changes save automatically. Disable CAT to edit; Refresh lists reloads presets/connections.
 All configured profiles must have valid presets/connections, even if deselected. Deleted/unavailable choices must be replaced. LumiRealm/Risu presets are excluded.
 Composer cat icon / input-bar CAT action: enable/disable; switch profiles ON/OFF; Manage profiles opens Settings. Keep at least one selected. Selection and enabled state persist across sends, reloads and chat forks; selection changes affect following runs. Settings/activation belong to the user, history to each chat.
 CAT tab displays cat photos; icons/backgrounds rotate on interaction. These are decorative and do not affect generation.` },
-  { id: "generation", label: "Send, stream, stop, cache review", text: `Enable CAT in a private single-character text chat; send normally. CAT intercepts normal browser sends, prepares each selected profile's prompt, then streams requests concurrently into one assistant message's swipes. Dry runs and non-normal generation modes are not CAT runs. Navigate swipes while streaming; each retains its preset's formatting/regex and reasoning.
+  { id: "generation", label: "Send, stream, stop", text: `Enable CAT in a private single-character text chat; send normally. CAT intercepts normal browser sends, prepares each selected profile's prompt, then streams requests concurrently into one assistant message's swipes. Dry runs and non-normal generation modes are not CAT runs. Navigate swipes while streaming; each retains its preset's formatting/regex and reasoning.
 Mixed-preset history/selection adds a short instruction to use currently specified prose structures rather than repeat old preset templates. A single-profile CAT setup can switch presets while retaining old messages' rendering.
-Once a send reaches Lumiverse, preparation/generation runs on the server: navigating away or closing the browser does not stop it. Lumiverse must stay running. Reopen the chat to recover saved replies/history. This does not promise recovery across a server/extension restart.
+Keep the controlling browser tab open and connected while CAT prepares and generates swipes. Closing or disconnecting it stops the run; partial replies may remain. Reopen the chat to view saved replies/history.
 Stop in Swipes, the composer, or "Stop parallel swipes" cancels active requests; Disable also disarms/stops. Already generated text may remain. A new message can stop previous swipes. Wait for completion or stop before starting another run.
-With LumiCache installed, all profile prompts pass review/force consistency before any swipe starts. Declining one review stops the batch. Handle send approvals in LumiCache, not through the docs bridge.` },
+CAT does not send its parallel requests through LumiCache review.` },
   { id: "swipes", label: "History, rendering, variables, forks", text: `Swipes tab: current/recent runs show message number, character, time, each profile's preset/connection, progress and errors. Up to 20 runs are retained per chat. Click a non-waiting row for the latest message to open its swipe; older run rows are informational. Use native chat swipe navigation where available. Some requests can fail while others finish; inspect each row's error before retrying.
 Each swipe retains its own preset context and reasoning. Selecting a swipe restores its captured variable state through Lumiverse; avoid manually overwriting CAT metadata or variable snapshots. A variable error means state could not be applied; resolve it before continuing.
 Forks and native chat export/import preserve message-linked CAT data; restored histories use the new chat/message identities. Native history restoration also restores preset contexts. Deleted messages lose their history entries. Edits/deletions during streaming can invalidate a run; CAT must not recreate deleted messages.
 Browser reopening restores saved runs, not transient model execution after a server restart.` },
-  { id: "troubleshooting", label: "Requirements and failure recovery", text: `Requires a current Lumiverse build with CAT's background generation, managed messages, per-swipe preset/reasoning/variables and conditional metadata support; follow the exact "Update Lumiverse" error. Extension minimum is 1.3.0, but required capabilities must also be present.
+  { id: "troubleshooting", label: "Requirements and failure recovery", text: `Requires a current Lumiverse build with managed messages, per-swipe preset/reasoning/variables and conditional metadata support; follow the exact "Update Lumiverse" error. Extension minimum is 1.3.0, but required capabilities must also be present.
 Unsupported: group chats, multiplayer rooms, Council with members enabled, temporary chats with presets disabled, LumiRealm/Risu presets. Chats with attachments fall back to ordinary Lumiverse generation because CAT is text-only. Use a private single-character text chat, native presets and Council off.
-"Add a profile"/unavailable choices: Disable, fix every profile in Settings, Refresh lists, Enable. "Another browser controls CAT": disable there first; detached server work may still be running. "Wait"/fork switching: let it finish or Stop. Preparation/provider errors: inspect Swipes details and check the selected connection/preset; a failed batch may leave successful/partial swipes, so inspect before resending.
-Cache pause: open LumiCache in the sending browser, inspect/approve or cancel there; missing browser approval may time out. Docs bridge unavailable: enable both extensions and grant CAT's characters permission for LumiAgent's request-envelope handshake, then restart/refresh discovery. CAT docs require no focused character or live browser and expose no chat/user content.` }
+"Add a profile"/unavailable choices: Disable, fix every profile in Settings, Refresh lists, Enable. "Another browser controls CAT": disable there first or wait for its browser connection to expire. "Wait"/fork switching: let it finish or Stop. Preparation/provider errors: inspect Swipes details and check the selected connection/preset; a failed batch may leave successful/partial swipes, so inspect before resending.
+Docs bridge unavailable: enable both extensions and grant CAT's characters permission for LumiAgent's request-envelope handshake, then restart/refresh discovery. CAT docs require no focused character or live browser and expose no chat/user content.` }
 ];
 function registerAgentDocs(api) {
   api.rpcPool.handle("phoneline", async (context) => {
@@ -1780,8 +1610,6 @@ for (const event of ["GENERATION_ENDED", "GENERATION_STOPPED"])
       active.delete(key);
   });
 async function loadCatalog(userId, chatId) {
-  if (!spindle.host.capabilities["chat-append-identity-v1"])
-    throw new Error("Update Lumiverse to a build with background CAT generation support before enabling CAT.");
   if (!spindle.host.capabilities["generation-message-sessions-v1"])
     throw new Error("Update Lumiverse to a build with managed message generation before enabling CAT.");
   if (!spindle.host.capabilities["message-preset-context-v1"])
@@ -1822,16 +1650,18 @@ spindle.onFrontendMessage(async (raw, userId, session) => {
     switch (msg.operation) {
       case "load":
         value = await loadCatalog(userId, typeof input.chatId === "string" ? input.chatId : undefined);
-        automation.resume(userId, session, typeof input.chatId === "string" ? input.chatId : undefined);
         break;
       case "activation":
         value = await automation.setActivation(userId, input);
+        break;
+      case "preparePreset":
+        value = await automation.preparePreset(userId, session, String(input.runId), Number(input.stepIndex));
         break;
       case "save":
         value = await storage.save(userId, input.settings);
         break;
       case "heartbeat":
-        value = automation.heartbeat(userId, session);
+        value = leases.heartbeat(userId, session);
         break;
       case "arm":
         if (typeof input.chatId !== "string" || typeof input.connectionId !== "string")
@@ -1854,12 +1684,17 @@ spindle.onFrontendMessage(async (raw, userId, session) => {
         const checked = await storage.history(userId, input.chatId);
         const messages = await restoreMessageContexts(spindle, input.chatId, checked);
         await storage.reconcileHistory(userId, checked, messages);
-        automation.resume(userId, session, input.chatId);
         value = { messages, history: await storage.history(userId, input.chatId) };
         break;
       }
       case "disarm":
         value = await automation.disarm(userId, session, input.stop === true);
+        break;
+      case "launch":
+        value = await automation.launch(userId, session, String(input.runId), String(input.messageId), input.prompts);
+        break;
+      case "preparationFailed":
+        value = await automation.preparationFailed(userId, session, String(input.runId), String(input.error), String(input.chatId), typeof input.messageId === "string" ? input.messageId : undefined);
         break;
       case "selectSwipe": {
         const runId = String(input.runId);

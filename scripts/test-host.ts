@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import assert from "node:assert/strict";
-import type { Operations, Reply } from "../src/types";
+import type { Operations, Reply, Preparation } from "../src/types";
 import type { ViewState } from "../src/shared";
 import { PRESET_CHANGE_NOTE } from "../src/generation/preset-context";
 
@@ -25,7 +25,7 @@ const password = crypto.randomUUID();
 let cookie = "";
 let socket: WebSocket | undefined;
 let view: ViewState | undefined;
-let viewArmed = false;
+let preparation: Preparation | undefined;
 let failB = false;
 let active = 0, maxActive = 0;
 let tokenDelay = 90;
@@ -97,7 +97,8 @@ try {
       if (msg.event !== "SPINDLE_FRONTEND_MSG") return;
       const data = msg.payload.data;
       if (data.type === "reply") replies.set(data.id, data);
-      else if (data.type === "view") { view = data.view; viewArmed = data.armed === true; }
+      else if (data.type === "view") view = data.view;
+      else if (data.type === "prepare") preparation = data;
     });
     await until("WebSocket", () => socket!.readyState, state => state === WebSocket.OPEN);
   }
@@ -141,13 +142,6 @@ try {
     socket!.send(JSON.stringify({ type: "SPINDLE_BACKEND_MSG", extensionId: extension.id, payload: { type: "request", id, operation, input } }));
     const reply = await until(operation, () => replies.get(id), Boolean); replies.delete(id);
     if (reply!.error) throw new Error(reply!.error); return reply!.value as Operations[K]["output"];
-  }
-  if (process.argv.includes("--expect-incompatible-host")) {
-    await assert.rejects(rpc("load", {}), /Update Lumiverse to a build with background CAT generation support/);
-    assert.equal(requests.length, 0);
-    pass("hosts without message identity support fail before any provider request");
-    await Bun.write(join(runDir, "results.json"), JSON.stringify({ results }, null, 2));
-    socket?.close(); provider.stop(); process.exit(0);
   }
   const connection = await api("/api/v1/connections", "POST", { name: "Main · local fixture", provider: "custom", api_url: `http://127.0.0.1:${port + 1}/v1`, model: "fixture-main", is_default: true });
   const alternate = await api("/api/v1/connections", "POST", { name: "Alternate · local fixture", provider: "custom", api_url: `http://127.0.0.1:${port + 1}/v1`, model: "fixture-alt" });
@@ -200,22 +194,28 @@ try {
   for (const profile of [connection, alternate]) await api(`/api/v1/connections/${profile.id}`, "PUT", { preset_id: boundPreset.id });
 
   async function begin(text: string, targetChatId = chat.id) {
-    const sources = await Promise.all(presets.map(p => api(`/api/v1/presets/${p.id}`)));
-    const before = new Set((await api(`/api/v1/chats/${targetChatId}/messages?full=true`)).data.map((m: any) => m.id));
+    preparation = undefined;
     await api(`/api/v1/chats/${targetChatId}/messages`, "POST", { is_user: true, name: "User", content: text });
     await api("/api/v1/generate", "POST", { chat_id: targetChatId, connection_id: connection.id, preset_id: presets[0].id, generation_type: "normal" });
-    const reply = await until("backend preparation and launch", async () => (await api(`/api/v1/chats/${targetChatId}/messages?full=true`)).data,
-      messages => messages.some((m: any) => !before.has(m.id) && m.extra.spindle_metadata?.another_one_presets));
-    for (const source of sources) {
-      const copy = await api(`/api/v1/presets/${source.id}`);
-      assert.deepEqual(copy, source, "preparing must not modify the source preset");
+    const prepared = await until("native send handoff", () => preparation, Boolean) as Preparation;
+    const prompts = await Promise.all(prepared.slots.map(async (s, stepIndex) => {
+      const source = await api(`/api/v1/presets/${s.presetId}`);
+      const capture = await rpc("preparePreset", { runId: prepared.runId, stepIndex });
+      const copy = await api(`/api/v1/presets/${capture.presetId}`);
+      assert.equal(capture.presetId, source.id);
       if (source.prompt_order[0].sealed) {
+        assert.deepEqual(copy.prompt_order, source.prompt_order);
         const portable = await buildPortablePresetExportAsync(user.id, copy);
         assert.equal(portable.blocks[0].content, "{{presetBlock::main}}");
         assert(!JSON.stringify(portable).includes(source.prompt_order[0].content));
+        assert.deepEqual(copy.metadata._lumiverse_sealed_preset, source.metadata._lumiverse_sealed_preset);
       }
-    }
-    return reply.find((m: any) => !before.has(m.id) && m.extra.spindle_metadata?.another_one_presets).id;
+      assert.deepEqual(await api(`/api/v1/presets/${s.presetId}`), source, "preparing must not modify the source preset");
+      return capture.prompt;
+    }));
+    const reply = await api(`/api/v1/chats/${targetChatId}/messages`, "POST", { is_user: false, name: prepared.name, content: "", extra: { character_id: character.id, spindle_metadata: { another_one_run: prepared.runId } } });
+    await rpc("launch", { runId: prepared.runId, messageId: reply.id, prompts });
+    return reply.id;
   }
   await rpc("arm", { chatId: chat.id, connectionId: connection.id });
   const { interceptorPipeline } = await fromHost("spindle/interceptor-pipeline.ts");
@@ -247,8 +247,7 @@ try {
   const saved = (await api(`/api/v1/chats/${chat.id}/messages?full=true`)).data.at(-1);
   assert.deepEqual(saved.extra.spindle_metadata.other_extension, { value: "written during streaming" });
   pass("final stream writes retain metadata added by another extension");
-  assert.equal(saved.id, replyId); assert.equal(saved.name, character.name);
-  assert.equal(saved.chat_id, chat.id); assert.equal(chat.character_id, character.id);
+  assert.equal(saved.id, replyId); assert.equal(saved.name, "Miso");
   assert.equal(saved.swipe_id, 1, "stream writes must preserve the user's selected swipe");
   assert.deepEqual(saved.extra.reasoningBySwipe, [..."ABC"].map(marker => [1, 2, 3].map(i => `PRESET_${marker} thought${i} `).join("")));
   assert.equal(saved.extra.reasoning, saved.extra.reasoningBySwipe[1]);
@@ -528,21 +527,16 @@ try {
   assert(!(await api(`/api/v1/chats/${repeatFork.id}/messages?full=true`)).data.some((m: any) => m.id === deletedDuringStream));
   pass("deleting a streaming reply stops its requests without recreating the message or its swipe history");
   await rpc("arm", { chatId: repeatFork.id, connectionId: connection.id });
-  let releasePreparation!: () => void;
-  let preparing = false;
-  const preparationGate = new Promise<void>(resolve => { releasePreparation = resolve; });
-  interceptorPipeline.register({ extensionId: "preparation-gate", priority: 100, handler: async (messages: any[]) => {
-    preparing = true; await preparationGate; return { messages };
-  } });
-  const beforeCancellation = new Set((await api(`/api/v1/chats/${repeatFork.id}/messages?full=true`)).data.map((m: any) => m.id));
+  preparation = undefined;
   await api(`/api/v1/chats/${repeatFork.id}/messages`, "POST", { is_user: true, name: "User", content: "CANCEL_DURING_PREPARATION" });
   await api("/api/v1/generate", "POST", { chat_id: repeatFork.id, connection_id: connection.id, generation_type: "normal" });
-  await until("backend preparation to cancel", () => preparing, Boolean);
-  await rpc("disarm", { stop: true }); releasePreparation();
-  interceptorPipeline.unregisterByExtension("preparation-gate");
-  await Bun.sleep(250);
-  assert(!(await api(`/api/v1/chats/${repeatFork.id}/messages?full=true`)).data.some((m: any) => !beforeCancellation.has(m.id) && !m.is_user));
-  pass("cancelling backend preparation creates no abandoned reply or swipe entry");
+  const cancelled = await until("preparation to cancel", () => preparation, Boolean) as Preparation;
+  await rpc("disarm", { stop: true });
+  const abandoned = await api(`/api/v1/chats/${repeatFork.id}/messages`, "POST", { is_user: false, name: cancelled.name, content: "",
+    extra: { spindle_metadata: { another_one_run: cancelled.runId } } });
+  await rpc("preparationFailed", { runId: cancelled.runId, chatId: repeatFork.id, messageId: abandoned.id, error: "Stopped" });
+  assert(!(await api(`/api/v1/chats/${repeatFork.id}/messages?full=true`)).data.some((m: any) => m.id === abandoned.id));
+  pass("a blank reply created after cancellation is removed without creating a swipe entry");
   const variablesChat = await api("/api/v1/chats", "POST", { character_id: character.id, name: "Variable history verification" });
   await rpc("save", { settings: { version: 1, cats: false, slots: [0, 1].map(i => ({ id: `variables-${i}`, presetId: presets[i].id, connectionId: connection.id })) } });
   await rpc("arm", { chatId: variablesChat.id, connectionId: connection.id });
@@ -644,63 +638,6 @@ try {
     }
   }
   pass("completion listeners run once on the selected successful reply after response regexes, reasoning and native carriers are saved");
-  failB = false; tokenDelay = 25;
-  const backgroundChat = await api("/api/v1/chats", "POST", { character_id: character.id, name: "Background generation verification" });
-  const backgroundEvents: any[] = [];
-  const unsubscribeBackground = eventBus.on("GENERATION_ENDED", (event: any) => {
-    if (event.payload.chatId === backgroundChat.id) backgroundEvents.push(event.payload);
-  });
-  for (const disconnectDuring of ["preparation", "streaming", "reconnect", "disabled-reconnect"]) {
-    firstTokenDelay = disconnectDuring === "disabled-reconnect" ? 1500 : 0;
-    await rpc("arm", { chatId: backgroundChat.id, connectionId: connection.id });
-    const before = backgroundEvents.length;
-    let release!: () => void;
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    let preparing = false;
-    const removeGate = interceptorPipeline.register({ extensionId: "background-preparation", priority: 100, handler: async (messages: any[]) => {
-      preparing = true; await gate; return { messages };
-    } });
-    await api(`/api/v1/chats/${backgroundChat.id}/messages`, "POST", { is_user: true, name: "User", content: `BACKGROUND_${disconnectDuring}` });
-    await api("/api/v1/generate", "POST", { chat_id: backgroundChat.id, connection_id: connection.id, generation_type: "normal" });
-    await until("background preparation", () => preparing, Boolean);
-    if (disconnectDuring !== "preparation") {
-      release(); removeGate();
-      await until("background streaming", () => api(`/api/v1/generate/status/${backgroundChat.id}`), s => s.active && s.renderMode === "persisted-message");
-    }
-    if (disconnectDuring === "disabled-reconnect") await rpc("disarm", {});
-    const closed = socket!; closed.close();
-    await until("browser disconnected during generation", () => closed.readyState, state => state === WebSocket.CLOSED);
-    if (disconnectDuring === "preparation") { release(); removeGate(); }
-    if (disconnectDuring === "reconnect" || disconnectDuring === "disabled-reconnect") {
-      await connectBrowser(crypto.randomUUID().replaceAll("-", ""));
-      await rpc("load", {});
-      await rpc("restoreContexts", { chatId: backgroundChat.id });
-      await until("resumed CAT status", () => view, v => v?.phase === "running" && v.run?.chatId === backgroundChat.id);
-      if (disconnectDuring === "disabled-reconnect") {
-        assert.equal(viewArmed, false); assert.equal(await rpc("heartbeat", {}), true);
-        await until("disabled resumed generation finishes", () => view, v => v?.phase === "off" && v.run?.outcome === "complete");
-        assert.equal(backgroundEvents.length, before + 1);
-        pass("disabled in-flight generation resumes control and reports completion after reconnecting");
-      } else {
-        await rpc("disarm", { stop: true });
-        await until("resumed Stop settles", () => view, v => v?.phase === "off" && v.run?.outcome === "stopped");
-        assert.equal(backgroundEvents.length, before);
-      }
-    } else {
-      await until("completion with no browser connected", () => backgroundEvents.length, count => count === before + 1);
-      await connectBrowser(crypto.randomUUID().replaceAll("-", ""));
-      const saved = await until("background run persisted", () => rpc("load", { chatId: backgroundChat.id }), c => c.history.some(r => r.messageId === backgroundEvents.at(-1).messageId && r.outcome === "complete"));
-      const run = saved.history.find(r => r.messageId === backgroundEvents.at(-1).messageId)!;
-      const message = chatsService.getMessage(user.id, run.messageId);
-      assert(message.swipes.every((swipe: string) => swipe.includes("word30") || swipe.includes("FINAL_")));
-      assert.equal(message.chat_id, backgroundChat.id);
-      assert.equal((await api(`/api/v1/chats/${backgroundChat.id}`)).character_id, character.id);
-      assert.equal(message.name, character.name); assert.equal(message.extra.character_id, character.id);
-      assert(run.steps.every(step => step.status === "done"));
-    }
-  }
-  unsubscribeBackground();
-  pass("closing the browser during preparation or streaming preserves all completed swipes, and a new browser can resume and Stop a running generation");
   failB = false; firstTokenDelay = 1500;
   for (const restart of [false, true]) {
     await rpc("arm", { chatId: lifecycleChat.id, connectionId: connection.id });
