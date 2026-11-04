@@ -389,7 +389,74 @@ class ParallelRun {
   }
 }
 
+// src/backend/lumicache.ts
+var POLICY = { requires: ["generation"] };
+var REVIEW_LIMIT_MS = 300000;
+var notRegistered = (error) => /not registered/i.test(errorText(error));
+
+class LumiCacheLink {
+  api;
+  pollMs;
+  tail = Promise.resolve();
+  constructor(api, pollMs = 150) {
+    this.api = api;
+    this.pollMs = pollMs;
+  }
+  send(request) {
+    const work = this.tail.then(async () => {
+      this.api.rpcPool.sync("cache_request", request, POLICY);
+      try {
+        await this.api.rpcPool.read("lumicache.cat");
+      } finally {
+        this.api.rpcPool.sync("cache_request", null, POLICY);
+      }
+    });
+    this.tail = work.catch(() => {});
+    return work;
+  }
+  async check(input, cancelled) {
+    try {
+      await this.send({ op: "check", ...input });
+    } catch (error) {
+      if (notRegistered(error))
+        return null;
+      throw error;
+    }
+    const deadline = Date.now() + REVIEW_LIMIT_MS;
+    while (Date.now() < deadline) {
+      if (cancelled()) {
+        await this.send({ op: "cancel", id: input.id });
+        throw new Error("Stopped before generating swipes.");
+      }
+      const result = await this.read(input.id);
+      if (result?.status === "done")
+        return result.messages;
+      if (result?.status === "error")
+        throw new Error(result.error);
+      await Bun.sleep(this.pollMs);
+    }
+    throw new Error("LumiCache did not answer in time. Retry sending.");
+  }
+  async read(id) {
+    try {
+      return await this.api.rpcPool.read(`lumicache.cat_result.${id}`);
+    } catch (error) {
+      if (notRegistered(error))
+        return null;
+      throw error;
+    }
+  }
+  finish(id, userId, success) {
+    return this.send({ op: "finish", id, userId, success });
+  }
+}
+
 // src/backend/automation.ts
+var streamModel = (prompt) => {
+  const model = prompt.parameters.model;
+  return typeof model === "string" && model.trim() ? model.trim() : prompt.model;
+};
+
 class Automation {
   api;
   storage;
@@ -401,6 +468,7 @@ class Automation {
   owners = new Map;
   arming = new Map;
   active = new Map;
+  cache;
   constructor(api, storage, leases, catalog, inspect, variables, prepareChat) {
     this.api = api;
     this.storage = storage;
@@ -409,6 +477,8 @@ class Automation {
     this.inspect = inspect;
     this.variables = variables;
     this.prepareChat = prepareChat;
+    if (api.rpcPool)
+      this.cache = new LumiCacheLink(api);
     api.on("GENERATION_STARTED", (payload, user) => {
       if (user)
         this.started(payload, user);
@@ -774,19 +844,59 @@ class Automation {
     owner.parent = undefined;
     if (owner.armed && owner.takingOver === p.generationId && owner.preparation) {
       owner.takingOver = undefined;
-      owner.deadline = setTimeout(() => {
-        this.fail(owner, "Prompt preparation did not finish. Enable again to retry.");
-      }, 120000);
+      this.armDeadline(owner);
       await this.prepare(owner, owner.preparation);
     } else
       await this.disarm(user, owner.session, true, "Stopped before generating swipes.");
   }
+  armDeadline(owner) {
+    clearTimeout(owner.deadline);
+    owner.deadline = setTimeout(() => {
+      this.fail(owner, "Prompt preparation did not finish. Enable again to retry.");
+    }, 120000);
+  }
+  async checkCache(owner, preparation, prompts) {
+    if (!this.cache)
+      return;
+    clearTimeout(owner.deadline);
+    for (const [index, prompt] of prompts.entries()) {
+      const slot = owner.slots[index];
+      const id = crypto.randomUUID();
+      const messages = await this.cache.check({
+        id,
+        userId: owner.user,
+        chatId: preparation.chatId,
+        slotId: slot.id,
+        label: `CAT ${owner.catalog.presets.find((preset) => preset.id === slot.presetId)?.name ?? slot.presetId}`,
+        connectionId: prompt.connectionId,
+        model: streamModel(prompt),
+        session: owner.session,
+        messages: withPresetNote(prompt.messages, preparation.mixedPresets === true)
+      }, () => owner.preparation !== preparation);
+      if (!messages)
+        break;
+      prompt.messages = messages;
+      prompt.cacheCheckId = id;
+    }
+    this.armDeadline(owner);
+  }
+  finishCache(owner, prompts, done) {
+    const reports = prompts.flatMap((prompt, index) => prompt.cacheCheckId ? [this.cache.finish(prompt.cacheCheckId, owner.user, done(index))] : []);
+    return Promise.all(reports);
+  }
   async prepare(owner, preparation) {
     let messageId;
+    let checked = [];
     try {
       const prompts = await Promise.all(preparation.slots.map(async (_, index) => (await this.preparePreset(owner.user, owner.session, preparation.runId, index)).prompt));
       if (owner.preparation !== preparation)
         return;
+      checked = prompts;
+      await this.checkCache(owner, preparation, prompts);
+      if (owner.preparation !== preparation) {
+        await this.finishCache(owner, prompts, () => false);
+        return;
+      }
       messageId = (await this.api.chat.appendMessage(preparation.chatId, {
         role: "assistant",
         content: "",
@@ -799,6 +909,7 @@ class Automation {
       await this.launch(owner.user, owner.session, preparation.runId, messageId, prompts);
     } catch (error) {
       await this.preparationFailed(owner.user, owner.session, preparation.runId, errorText(error), preparation.chatId, messageId);
+      await this.finishCache(owner, checked, () => false).catch((reason) => this.emit(owner, "error", `Could not update LumiCache: ${errorText(reason)}`));
     }
   }
   async launch(user, session, runId, messageId, prompts) {
@@ -863,14 +974,14 @@ class Automation {
       }))
     }, prompts, {
       stream: (prompt, signal) => {
-        const { model, ...parameters } = prompt.parameters;
+        const { model: _model, ...parameters } = prompt.parameters;
         const request = {
           type: "raw",
           userId: user,
           connection_id: prompt.connectionId,
           provider: prompt.provider,
-          model: typeof model === "string" && model.trim() ? model.trim() : prompt.model,
-          messages: withPresetNote(prompt.messages, mixedPresets),
+          model: streamModel(prompt),
+          messages: prompt.cacheCheckId ? prompt.messages : withPresetNote(prompt.messages, mixedPresets),
           parameters,
           signal,
           sessionId: owner.managedId,
@@ -947,6 +1058,7 @@ class Automation {
     });
     owner.current = run;
     owner.completion = run.run().then(async (record) => {
+      await this.finishCache(owner, prompts, (index) => record.steps[index]?.status === "done");
       if (!run.deleted)
         await this.storage.record(user, record);
       owner.current = undefined;

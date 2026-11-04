@@ -3,6 +3,7 @@ import { ParallelRun, type PreparedPrompt } from "../generation/parallel-run";
 import { errorText, validateSlots, type ActivationPatch, type Catalog, type Inspection, type ViewState } from "../shared";
 import type { Preparation } from "../types";
 import type { Leases } from "./leases";
+import { LumiCacheLink } from "./lumicache";
 import type { Storage } from "./storage";
 import { contentHash, usesMultiplePresets, withPresetNote } from "../generation/preset-context";
 import type { VariableCapture } from "./variable-capture";
@@ -12,7 +13,7 @@ import type { MessageVariables } from "../generation/variable-state";
 interface Parent { renderMode?: string; targetMessageId?: string; generationId: string; chatId: string; generationType?: string; frontendSessionId?: string; characterName?: string; characterId?: string }
 interface Owner {
   user: string; session: string; chatId: string; armed: boolean; view: ViewState;
-  slots: Preparation["slots"]; catalog: Catalog; parent?: Parent; takingOver?: string;
+  slots: Array<Preparation["slots"][number] & { id: string }>; catalog: Catalog; parent?: Parent; takingOver?: string;
   configured: Array<Preparation["slots"][number] & { id: string }>; nextIds?: string[];
   preparation?: Preparation; current?: ParallelRun; deadline?: ReturnType<typeof setTimeout>; launching?: string;
   prepared?: Map<number, Promise<{ token: string; presetId: string; prompt: PreparedPrompt }>>;
@@ -21,14 +22,21 @@ interface Owner {
   switching?: boolean; completion?: Promise<void>; navigation?: number;
 }
 
+const streamModel = (prompt: PreparedPrompt) => {
+  const model = prompt.parameters.model;
+  return typeof model === "string" && model.trim() ? model.trim() : prompt.model;
+};
+
 export class Automation {
   private owners = new Map<string, Owner>();
   private arming = new Map<string, { session: string; chatId: string; background: boolean; detached: boolean }>();
   private active = new Map<string, Parent>();
+  private cache?: LumiCacheLink;
   constructor(private api: SpindleAPI, private storage: Storage, private leases: Leases,
     private catalog: (user: string) => Promise<Catalog>, private inspect: (chat: string, user: string) => Promise<Inspection>,
     private variables?: { capture: VariableCapture; selection: VariableSelection },
     private prepareChat?: (user: string, chatId: string) => Promise<void>) {
+    if (api.rpcPool) this.cache = new LumiCacheLink(api);
     api.on("GENERATION_STARTED", (payload, user) => { if (user) this.started(payload as Parent, user); });
     api.on("FRONTEND_SESSION_CLOSED", (raw, user) => {
       if (!user) return;
@@ -272,16 +280,45 @@ export class Automation {
     owner.parent = undefined;
     if (owner.armed && owner.takingOver === p.generationId && owner.preparation) {
       owner.takingOver = undefined;
-      owner.deadline = setTimeout(() => { void this.fail(owner, "Prompt preparation did not finish. Enable again to retry."); }, 120_000);
+      this.armDeadline(owner);
       await this.prepare(owner, owner.preparation);
     } else await this.disarm(user, owner.session, true, "Stopped before generating swipes.");
   }
+  private armDeadline(owner: Owner) {
+    clearTimeout(owner.deadline);
+    owner.deadline = setTimeout(() => { void this.fail(owner, "Prompt preparation did not finish. Enable again to retry."); }, 120_000);
+  }
+  /** One profile at a time, so LumiCache only ever shows one review. */
+  private async checkCache(owner: Owner, preparation: Preparation, prompts: PreparedPrompt[]) {
+    if (!this.cache) return;
+    // A person may take minutes to answer a review.
+    clearTimeout(owner.deadline);
+    for (const [index, prompt] of prompts.entries()) {
+      const slot = owner.slots[index];
+      const id = crypto.randomUUID();
+      const messages = await this.cache.check({ id, userId: owner.user, chatId: preparation.chatId, slotId: slot.id,
+        label: `CAT ${owner.catalog.presets.find(preset => preset.id === slot.presetId)?.name ?? slot.presetId}`,
+        connectionId: prompt.connectionId, model: streamModel(prompt), session: owner.session,
+        messages: withPresetNote(prompt.messages, preparation.mixedPresets === true) }, () => owner.preparation !== preparation);
+      if (!messages) break;
+      prompt.messages = messages; prompt.cacheCheckId = id;
+    }
+    this.armDeadline(owner);
+  }
+  private finishCache(owner: Owner, prompts: PreparedPrompt[], done: (index: number) => boolean) {
+    const reports = prompts.flatMap((prompt, index) => prompt.cacheCheckId ? [this.cache!.finish(prompt.cacheCheckId, owner.user, done(index))] : []);
+    return Promise.all(reports);
+  }
   private async prepare(owner: Owner, preparation: Preparation) {
     let messageId: string | undefined;
+    let checked: PreparedPrompt[] = [];
     try {
       const prompts = await Promise.all(preparation.slots.map(async (_, index) =>
         (await this.preparePreset(owner.user, owner.session, preparation.runId, index)).prompt));
       if (owner.preparation !== preparation) return;
+      checked = prompts;
+      await this.checkCache(owner, preparation, prompts);
+      if (owner.preparation !== preparation) { await this.finishCache(owner, prompts, () => false); return; }
       messageId = (await this.api.chat.appendMessage(preparation.chatId, {
         role: "assistant", content: "", name: preparation.name, characterId: preparation.characterId,
         metadata: { another_one_run: preparation.runId },
@@ -290,6 +327,7 @@ export class Automation {
       await this.launch(owner.user, owner.session, preparation.runId, messageId, prompts);
     } catch (error) {
       await this.preparationFailed(owner.user, owner.session, preparation.runId, errorText(error), preparation.chatId, messageId);
+      await this.finishCache(owner, checked, () => false).catch(reason => this.emit(owner, "error", `Could not update LumiCache: ${errorText(reason)}`));
     }
   }
   async launch(user: string, session: string, runId: string, messageId: string, prompts: PreparedPrompt[]): Promise<boolean> {
@@ -330,10 +368,10 @@ export class Automation {
         connectionName: owner.catalog.connections.find(c => c.id === s.connectionId)!.name, status: "waiting" })) }, prompts, {
       stream: (prompt, signal) => {
         // The prompt is already assembled. Quiet generation would merge the connection's bound preset again.
-        const { model, ...parameters } = prompt.parameters;
+        const { model: _model, ...parameters } = prompt.parameters;
         const request = { type: "raw" as const, userId: user, connection_id: prompt.connectionId, provider: prompt.provider,
-          model: typeof model === "string" && model.trim() ? model.trim() : prompt.model,
-          messages: withPresetNote(prompt.messages, mixedPresets), parameters, signal, sessionId: owner.managedId, swipeIndex: prompts.indexOf(prompt) };
+          model: streamModel(prompt),
+          messages: prompt.cacheCheckId ? prompt.messages : withPresetNote(prompt.messages, mixedPresets), parameters, signal, sessionId: owner.managedId, swipeIndex: prompts.indexOf(prompt) };
         return this.api.generate.rawStream(request);
       },
       write: async (swipes, final, reasoning) => {
@@ -374,6 +412,7 @@ export class Automation {
     });
     owner.current = run;
     owner.completion = run.run().then(async record => {
+      await this.finishCache(owner, prompts, index => record.steps[index]?.status === "done");
       if (!run.deleted) await this.storage.record(user, record);
       owner.current = undefined; owner.managedId = undefined;
       if (owner.detached) owner.armed = false;

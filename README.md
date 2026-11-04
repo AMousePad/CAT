@@ -38,6 +38,10 @@ This is to prevent a preset's templates from confusing the AI and bleeding into 
 
 LumiRealm presets are not yet supported.
 
+## LumiCache
+
+When LumiCache is installed, each profile's prompt goes through its review and force consistency before any swipe starts. Declining a review stops all swipes for that message.
+
 ## TODO
 
 Not much tbh. This is supposed to be small and sweet. Feel free to suggest features though. Reach me at `amousepad` on Discord.

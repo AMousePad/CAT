@@ -6,7 +6,7 @@ import { Storage } from "../src/backend/storage";
 import type { Catalog } from "../src/shared";
 import { inspectChat } from "../src/backend/inspection";
 
-function fixture(savedStorage?: Storage, variables?: ConstructorParameters<typeof Automation>[5]) {
+function fixture(savedStorage?: Storage, variables?: ConstructorParameters<typeof Automation>[5], rpcPool?: unknown) {
   const handlers = new Map<string, Function>();
   let context!: (raw: unknown, signal?: AbortSignal) => Promise<any>;
   let messages: any[] = [];
@@ -14,6 +14,7 @@ function fixture(savedStorage?: Storage, variables?: ConstructorParameters<typeo
   let council = async () => ({ councilMode: false, members: [] });
   const sent: any[] = [], writes: string[][] = [], records: any[] = [], targets: string[] = [], deleted: string[] = [], generated: any[] = [];
   const api = {
+    rpcPool,
     on: (event: string, fn: Function) => { handlers.set(event, fn); return () => {}; },
     registerContextHandler: (fn: typeof context) => { context = fn; },
     sendToFrontend: (data: unknown, _user: string, options?: { frontendSessionId: string }) => { sent.push(data); targets.push(options?.frontendSessionId ?? "all"); },
@@ -32,6 +33,7 @@ function fixture(savedStorage?: Storage, variables?: ConstructorParameters<typeo
       if (message && patch.metadata) message.metadata = patch.metadata;
       if (message && patch.metadata_patch) message.metadata = { ...message.metadata, ...patch.metadata_patch };
     },
+      appendMessage: async (_c: string, input: any) => { const message = { id: "reply", index_in_chat: 1, swipes: [], extra: {}, ...input }; messages.push(message); return message; },
       deleteMessage: async (_c: string, id: string) => { deleted.push(id); } },
     generate: {
       dryRun: async () => ({ responseContextId: "context", request_messages: [{ role: "user", content: "Hi" }], parameters: {}, provider: "custom", model: "fixture" }),
@@ -348,4 +350,50 @@ test("native swipe navigation keeps streams alive; deleting a swipe stops furthe
   await Bun.sleep(5);
   expect(f.records[0].outcome).toBe("stopped");
   expect(f.writes).toHaveLength(count);
+});
+
+function cacheFixture(answer: (request: any) => unknown) {
+  const requests: any[] = [], results = new Map<string, unknown>();
+  let slot: any = null;
+  const rpcPool = {
+    sync: (_name: string, value: unknown) => { slot = value; return ""; },
+    read: async (name: string) => {
+      if (name === "lumicache.cat") {
+        requests.push(slot);
+        if (slot?.op === "check") results.set(slot.id, answer(slot));
+        return { accepted: true };
+      }
+      const value = results.get(name.split(".").at(-1)!);
+      if (!value) throw new Error(`Shared RPC endpoint "${name}" is not registered`);
+      return value;
+    },
+  };
+  const variables = { capture: { create: async () => ({ token: "token", presetId: "p" }), cancel: async () => {},
+    finish: async () => ({ presetId: "p", changes: [], local: {}, snapshot: { local: {}, global: {}, chat: {} }, before: { global: {}, chat: {} }, revision: null }) },
+    selection: { sync: async () => {} } } as unknown as ConstructorParameters<typeof Automation>[5];
+  return { f: fixture(undefined, variables, rpcPool), requests };
+}
+const waitFor = async (ready: () => boolean) => { for (let i = 0; i < 500 && !ready(); i++) await new Promise(resolve => setTimeout(resolve, 1)); expect(ready()).toBe(true); };
+
+test("swipes send the prompt LumiCache returns and report how they finished", async () => {
+  const restored = [{ role: "user", content: "Restored" }];
+  const { f, requests } = cacheFixture(() => ({ status: "done", messages: restored }));
+  await f.arm(); await f.context();
+  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
+  await waitFor(() => f.generated.length === 1);
+  expect(f.generated[0].messages).toEqual(restored);
+  expect(requests[0]).toMatchObject({ op: "check", slotId: "slot", connectionId: "c", model: "fixture", label: "CAT Preset" });
+  await f.automation.disarm("user", "session", true);
+  await waitFor(() => requests.some(request => request.op === "finish"));
+  expect(requests.at(-1)).toMatchObject({ op: "finish", id: requests[0].id, userId: "user", success: false });
+});
+
+test("a declined LumiCache review stops the swipes before a reply is created", async () => {
+  const { f, requests } = cacheFixture(() => ({ status: "error", error: "LumiCache cancelled this request before sending." }));
+  await f.arm(); await f.context();
+  f.emit("GENERATION_STOPPED", { generationId: "native", chatId: "chat" });
+  await waitFor(() => f.sent.some(sent => sent.view?.phase === "error"));
+  expect(f.sent.at(-1).view.detail).toContain("LumiCache cancelled");
+  expect(f.generated).toHaveLength(0);
+  expect(requests.map(request => request.op)).toEqual(["check"]);
 });
