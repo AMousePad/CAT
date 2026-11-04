@@ -103,6 +103,39 @@ try {
   }
   await connectBrowser(session);
   await until("worker boot", () => api("/api/v1/spindle"), v => v.extensions.some((e: any) => e.id === extension.id && e.status === "running"));
+  const pool = await fromHost("spindle/shared-rpc-pool.service.ts");
+  await manager.installFromFiles(new Map([
+    ["spindle.json", new TextEncoder().encode(JSON.stringify({ identifier: "lumiagent", name: "LumiAgent", version: "1.0.0", author: "test", github: "https://github.com/AMousePad/LumiAgent",
+      permissions: ["characters"], entry_backend: "backend.js" }))],
+    ["backend.js", new TextEncoder().encode("export {};")],
+  ]), {});
+  manager.grantPermission("lumiagent", "characters");
+  const docs = async (request: unknown) => {
+    pool.syncSharedRpcEndpoint("lumiagent", "phoneline_request", request, { requires: ["characters"] });
+    return pool.readSharedRpcEndpoint("another_one.phoneline", "lumiagent", manager.getGrantedPermissions);
+  };
+  const docsManifest = await until<any>("docs bridge", async () => {
+    try { return await docs({ op: "describe" }); }
+    catch (error) { if (/not registered/.test(String(error))) return null; throw error; }
+  }, Boolean);
+  assert.equal(docsManifest.extension.id, "another_one");
+  const docsSurface = docsManifest.surfaces.find((s: any) => s.id === "cat_docs");
+  assert.equal(docsSurface.scope, "global");
+  const topics = await docs({ op: "list_items", surfaceId: docsSurface.id });
+  assert.equal(topics.total, 5);
+  for (const topic of topics.items) {
+    const page = await docs({ op: "read_item", surfaceId: docsSurface.id, itemId: topic.id });
+    assert.equal(typeof page.value, "string"); assert(page.value.length > 100);
+  }
+  assert.equal((await docs({ op: "write_field", surfaceId: docsSurface.id, itemId: "overview", field: "text", value: "changed" })).ok, false);
+  manager.revokePermission("another_one", "characters");
+  await assert.rejects(docs({ op: "describe" }), /characters/);
+  manager.grantPermission("another_one", "characters");
+  pass("CAT worker exposes read-only docs through the permission-scoped LumiAgent phone line without a character or user request");
+  if (process.argv.includes("--docs-only")) {
+    await Bun.write(join(runDir, "results.json"), JSON.stringify({ results }, null, 2));
+    socket?.close(); provider.stop(); console.log(`HOST COMPLETE: ${results.length} docs check. Evidence: ${join(runDir, "results.json")}`); process.exit(0);
+  }
   async function rpc<K extends keyof Operations>(operation: K, input: Operations[K]["input"]): Promise<Operations[K]["output"]> {
     const id = crypto.randomUUID();
     socket!.send(JSON.stringify({ type: "SPINDLE_BACKEND_MSG", extensionId: extension.id, payload: { type: "request", id, operation, input } }));
