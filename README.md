@@ -2,6 +2,8 @@
 
 Otherwise known as CAT, this extension lets you generate several swipes at once, using a seperate preset/model for each swipe. Swipes render their regexes based on the preset that generated it, allowing you to mix and match presets without breaking other messages. Responses stream into each swipe, and they are all navigatable during streaming.
 
+Once a send reaches Lumiverse, CAT prepares and generates its swipes on the server. You can leave or close the browser tab and return to the saved replies. Lumiverse must stay running; pressing Stop still cancels generation.
+
 ![1793076455928](image/README/1793076455928.png)
 
 I made this for 3 reasons:
@@ -35,6 +37,10 @@ When a chat uses more than one preset through CAT, requests get this instruction
 This is to prevent a preset's templates from confusing the AI and bleeding into another preset.
 
 LumiRealm presets are not yet supported.
+
+## LumiCache
+
+When LumiCache is installed, each profile's prompt goes through its review and force consistency before any swipe starts. Declining a review stops all swipes for that message.
 
 ## TODO
 
