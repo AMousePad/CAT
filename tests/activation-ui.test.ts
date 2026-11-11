@@ -26,6 +26,7 @@ test("startup, live browser sync and authenticated reconnect use server activati
     const calls: string[] = [];
     const receive = (value: unknown) => { for (const listener of listeners) listener(value); };
     const ctx = {
+      uuid: { v4: () => crypto.randomUUID() },
       frontendSessionId: `browser-${clients.length}`, dom: { addStyle: () => noop, findMessageElement: () => null },
       ui: { registerDrawerTab: () => ({ root, tabId: "tab", setBadge: noop, destroy: () => root.remove(), onActivate: () => noop }),
         registerInputBarAction: () => ({ onClick: () => noop, setEnabled: noop, destroy: noop }), mount: () => actions },

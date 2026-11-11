@@ -18,8 +18,8 @@ export class Bridge {
   }
   call<K extends keyof Operations>(operation: K, input: Operations[K]["input"]): Promise<Operations[K]["output"]> {
     if (this.disposed) return Promise.reject(new Error("Extension unloaded."));
-    const id = randomId();
     return new Promise((resolve, reject) => {
+      const id = randomId(this.ctx);
       const timer = setTimeout(() => { this.pending.delete(id); reject(new Error("CAT's backend did not respond. Check the connection and extension permissions.")); }, 20_000);
       this.pending.set(id, { resolve: value => resolve(value as Operations[K]["output"]), reject, timer });
       try { this.ctx.sendToBackend({ type: "request", id, operation, input }); }

@@ -8,6 +8,7 @@ import { refreshCatIcons, rotateCatIcons } from "./cat-icons";
 import { ICON, STYLES } from "./styles";
 import { NAVBAR_ICON } from "./icons";
 import { renderSettings } from "./tabs/settings-tab";
+import { randomId } from "./id";
 import { renderSwipes } from "./tabs/swipes-tab";
 import { SwipeHotbar } from "./hotbar";
 import { ComposerStop } from "./composer-stop";
@@ -73,6 +74,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     if (selected === "settings") cleanupSettings = renderSettings(content, catalog, activation.enabled || controller.enabled, saving, {
       save: settings => { void save(settings); },
       reload: () => { void load(); },
+      newId: () => randomId(ctx),
     });
     else if (selected === "swipes") renderSwipes(content, view, history, () => { void controller.disable("Stopped.", true); }, controller.armed || controller.view.phase === "running",
       (run, stepIndex) => { void openSwipe(run, stepIndex); }, opening, ctx.messages.getLatestMessageId(), chatId,

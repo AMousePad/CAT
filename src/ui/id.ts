@@ -1,4 +1,6 @@
-/** Browser IDs also work on plain HTTP, where randomUUID is unavailable. */
-export function randomId(): string {
-  return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+import type { SpindleFrontendContext } from "lumiverse-spindle-types";
+
+export function randomId(ctx: SpindleFrontendContext): string {
+  if (!ctx.uuid) throw new Error("Update Lumiverse to a build with frontend UUID support to use CAT.");
+  return ctx.uuid.v4();
 }

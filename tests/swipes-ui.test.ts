@@ -33,6 +33,7 @@ test.each(["a", null])("the Swipes tab stays scoped through startup (%s), naviga
       registerInputBarAction: () => ({ onClick: () => noop, setEnabled: (value: boolean) => { stopEnabled = value; }, destroy: noop }), mount: () => actions },
     state: { get: (key: string) => key === "chat.active" ? { chatId } : { open: false, tabId: "tab" },
       subscribe: (key: string, callback: () => void) => { states.set(key, callback); return () => states.delete(key); } },
+    uuid: { v4: () => crypto.randomUUID() },
     connections: { getActive: () => ({ activeProfileId: "main" }) }, host: { capabilities: { "message-preset-context-v1": true }, surfaces: { invoke: async () => {} } },
     messages: { getLatestMessageId: () => chatId && `${chatId}-latest` }, events: { on: (name: string, callback: (raw: unknown) => void) => {
       if (!events.has(name)) events.set(name, new Set());

@@ -45,7 +45,7 @@ test("locked profiles show the editing hint on click; keyboard reordering saves 
   const catalog: Catalog = { settings: { version: 1, cats: true, slots: [{ id: "a", presetId: "a", connectionId: null }, { id: "b", presetId: "b", connectionId: null }] },
     presets: [{ id: "a", name: "A" }, { id: "b", name: "B" }], connections: [] };
   const saved: Settings[] = [];
-  const actions = { save: (s: Settings) => saved.push(s), reload() {} };
+  const actions = { save: (s: Settings) => saved.push(s), reload() {}, newId: () => "host-uuid" };
   let remove = renderSettings(host, catalog, true, false, actions);
   expect(host.querySelector(".ao-lock-tip")).toBeNull();
   host.querySelector<HTMLButtonElement>(".ao-lock-cover")!.click();
@@ -56,6 +56,8 @@ test("locked profiles show the editing hint on click; keyboard reordering saves 
   expect(host.querySelector('[aria-label^="Move profile"]')).toBeNull();
   host.querySelector(".ao-drag-handle")!.dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }) as unknown as Event);
   expect(saved[0].slots.map(s => s.id)).toEqual(["b", "a"]);
+  [...host.querySelectorAll("button")].find(b => b.textContent?.includes("Add profile"))!.click();
+  expect(saved.at(-1)!.slots.at(-1)!.id).toBe("host-uuid");
   cleanup = () => { remove(); window.close(); };
 });
 

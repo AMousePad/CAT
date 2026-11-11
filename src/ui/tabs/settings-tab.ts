@@ -2,10 +2,9 @@ import type { Catalog, Settings } from "../../shared";
 import { MAX_SWIPES } from "../../shared";
 import { button, catIcon, el, select } from "../components";
 import { profileDrag } from "../profile-drag";
-import { randomId } from "../id";
 
 export interface SettingsActions {
-  save(settings: Settings): void; reload(): void;
+  save(settings: Settings): void; reload(): void; newId(): string;
 }
 export function renderSettings(host: HTMLElement, catalog: Catalog, locked: boolean, saving: boolean, actions: SettingsActions) {
   const sequence = el("section");
@@ -50,7 +49,7 @@ export function renderSettings(host: HTMLElement, catalog: Catalog, locked: bool
   const actionsRow = el("div", "ao-actions");
   actionsRow.append(button("Add profile", () => change(s => {
     const preset = catalog.presets.find(p => !s.slots.some(slot => slot.presetId === p.id)) ?? catalog.presets[0];
-    s.slots.push({ id: randomId(), presetId: preset?.id || "", connectionId: null });
+    s.slots.push({ id: actions.newId(), presetId: preset?.id || "", connectionId: null });
   }), "", locked || saving || catalog.settings.slots.length >= MAX_SWIPES), button("Refresh lists", actions.reload, "", locked || saving));
   sequence.append(actionsRow);
   const credits = el("a", "ao-icon-credits", "Icon credits");

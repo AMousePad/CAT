@@ -236,8 +236,10 @@ class Session {
 }
 
 // src/ui/id.ts
-function randomId() {
-  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+function randomId(ctx) {
+  if (!ctx.uuid)
+    throw new Error("Update Lumiverse to a build with frontend UUID support to use CAT.");
+  return ctx.uuid.v4();
 }
 
 // src/ui/bridge.ts
@@ -266,8 +268,8 @@ class Bridge {
   call(operation, input) {
     if (this.disposed)
       return Promise.reject(new Error("Extension unloaded."));
-    const id = randomId();
     return new Promise((resolve, reject) => {
+      const id = randomId(this.ctx);
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error("CAT's backend did not respond. Check the connection and extension permissions."));
@@ -1121,7 +1123,7 @@ function renderSettings(host, catalog, locked, saving, actions) {
   const actionsRow = el("div", "ao-actions");
   actionsRow.append(button("Add profile", () => change((s) => {
     const preset = catalog.presets.find((p) => !s.slots.some((slot) => slot.presetId === p.id)) ?? catalog.presets[0];
-    s.slots.push({ id: randomId(), presetId: preset?.id || "", connectionId: null });
+    s.slots.push({ id: actions.newId(), presetId: preset?.id || "", connectionId: null });
   }), "", locked || saving || catalog.settings.slots.length >= MAX_SWIPES), button("Refresh lists", actions.reload, "", locked || saving));
   sequence.append(actionsRow);
   const credits = el("a", "ao-icon-credits", "Icon credits");
@@ -1702,7 +1704,8 @@ function setup(ctx) {
         },
         reload: () => {
           load();
-        }
+        },
+        newId: () => randomId(ctx)
       });
     else if (selected === "swipes")
       renderSwipes(content, view, history, () => {
